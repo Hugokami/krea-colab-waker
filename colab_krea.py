@@ -205,17 +205,6 @@ def _init_watchdog():
 # ---------------------------------------------------------------------------
 # Bootstrap, Drive, model cache
 # ---------------------------------------------------------------------------
-def bootstrap():
-    if os.path.exists(READY_FLAG):
-        return
-    print("[krea] First run on this VM: installing latest ComfyUI ...")
-    if not os.path.isdir(COMFY_DIR):
-        subprocess.run(["git", "clone", "--depth", "1", COMFY_REPO, COMFY_DIR], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/requirements.txt",
-                    "huggingface_hub"], check=True)
-    open(READY_FLAG, "w").close()
-
-
 def mount_drive() -> bool:
     if not os.path.isdir(DRIVE_ROOT):
         try:
@@ -225,8 +214,35 @@ def mount_drive() -> bool:
             print(f"[krea] Drive not mounted ({e}); using Colab SSD only.")
     if os.path.isdir(DRIVE_ROOT):
         os.makedirs(DRIVE_CACHE, exist_ok=True)
+        os.makedirs(f"{DRIVE_ROOT}/krea_comfy_outputs", exist_ok=True)
+        print(f"[krea] Google Drive mounted and cache active at: {DRIVE_CACHE}")
         return True
     return False
+
+
+def bootstrap(use_drive: bool = False):
+    if os.path.exists(READY_FLAG):
+        return
+    comfy_archive = f"{DRIVE_CACHE}/comfyui_repo.tar.gz"
+    if not os.path.isdir(COMFY_DIR):
+        if use_drive and os.path.isfile(comfy_archive) and os.path.getsize(comfy_archive) > 1_000_000:
+            print(f"[krea] Restoring ComfyUI directly from Google Drive ({comfy_archive}) ...")
+            subprocess.run(["tar", "-xzf", comfy_archive, "-C", "/content"], check=True)
+        else:
+            print("[krea] First run: cloning ComfyUI and caching to Google Drive ...")
+            subprocess.run(["git", "clone", "--depth", "1", COMFY_REPO, COMFY_DIR], check=True)
+            if use_drive:
+                try:
+                    tmp_tar = comfy_archive + ".part"
+                    subprocess.run(["tar", "-czf", tmp_tar, "-C", "/content", "ComfyUI"], check=True)
+                    os.replace(tmp_tar, comfy_archive)
+                    print(f"[krea] Cached ComfyUI repo to Google Drive: {comfy_archive}")
+                except Exception as e:
+                    print(f"[krea] Notice: could not archive ComfyUI to Drive ({e})")
+    print("[krea] Verifying Python dependencies ...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/requirements.txt",
+                    "huggingface_hub"], check=True)
+    open(READY_FLAG, "w").close()
 
 
 def repo_index(repo: str) -> dict:
@@ -251,7 +267,7 @@ def _atomic_copy(src: str, dst: str):
 
 
 def ensure_models(engine: str, mode: str, use_drive: bool):
-    """SSD target present -> done. Else Drive cache (size-verified vs HF) -> else HF download (+ cache to Drive)."""
+    """SSD target present -> done. Else fast Google Drive cache hit -> else HF download (+ cache to Drive)."""
     eng = ENGINES[engine]
     index = None
     for key, optional in required_files(mode):
@@ -260,6 +276,12 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         if _size(target) > 0:
             continue
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        cached = f"{DRIVE_CACHE}/{name}"
+        if use_drive and _size(cached) > 10_000_000 and not os.path.exists(cached + ".part"):
+            print(f"[krea] Google Drive cache hit: {name} ({_size(cached) / 1e9:.2f} GB) -> staging to SSD...")
+            _atomic_copy(cached, target)
+            _reset_activity()
+            continue
         if index is None:
             index = repo_index(eng["repo"])
         repo_path = resolve_repo_path(index, name)
@@ -269,9 +291,8 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
                 print(f"[krea] Optional file skipped: {msg}")
                 continue
             raise RuntimeError(msg)
-        cached = f"{DRIVE_CACHE}/{name}"
         if use_drive and _size(cached) == index[repo_path]:
-            print(f"[krea] Drive cache hit: {name}")
+            print(f"[krea] Google Drive cache hit: {name}")
             _atomic_copy(cached, target)
             continue
         print(f"[krea] Downloading {repo_path} ({index[repo_path] / 1e9:.2f} GB) ...")
@@ -279,8 +300,9 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         os.replace(hf_hub_download(eng["repo"], repo_path, local_dir=HF_DL_DIR), target)
         if use_drive:
             try:
+                print(f"[krea] Saving {name} permanently to Google Drive ({cached}) ...")
                 _atomic_copy(target, cached)
-                print(f"[krea] Cached to Drive: {cached}")
+                print(f"[krea] Cached to Google Drive: {cached}")
             except OSError as e:
                 print(f"[krea] Drive cache write failed ({e}); continuing from SSD.")
         _reset_activity()
@@ -326,14 +348,71 @@ def object_info() -> dict:
     return _http("/object_info", timeout=60)
 
 
-def run_prompt(graph: dict, timeout: int = RENDER_TIMEOUT_SECONDS) -> str:
+def _parse_mmss(s: str) -> int:
+    try:
+        parts = [int(p) for p in s.strip().split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except Exception:
+        pass
+    return 0
+
+
+def _parse_comfy_progress(t0: float, default_total: int = 28) -> dict | None:
+    try:
+        if not os.path.isfile(COMFY_LOG):
+            return None
+        with open(COMFY_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            sz = f.tell()
+            f.seek(max(0, sz - 2048), os.SEEK_SET)
+            chunk = f.read().decode("utf-8", errors="replace")
+        segments = [seg.strip() for seg in re.split(r"[\r\n]+", chunk) if seg.strip()]
+        for seg in reversed(segments):
+            m = re.search(r"(\d+)/(\d+)\s+\[([0-9:]+)<([0-9:?]+)", seg)
+            if m:
+                step, total = int(m.group(1)), int(m.group(2))
+                el_s = _parse_mmss(m.group(3)) or int(time.time() - t0)
+                eta_raw = m.group(4)
+                if "?" in eta_raw or step == 0:
+                    eta_s = max(5, int((total - step) * 4.8))
+                else:
+                    eta_s = _parse_mmss(eta_raw)
+                phase = "Loading models into T4 GPU VRAM..." if step == 0 else "Denoising on T4 GPU"
+                return {"phase": phase, "step": step, "total": total, "elapsed_s": el_s, "eta_s": eta_s}
+            if "Requested to load" in seg or "Model Initializing" in seg:
+                el_s = int(time.time() - t0)
+                return {"phase": "Loading models into T4 GPU VRAM...", "step": 0, "total": default_total, "elapsed_s": el_s, "eta_s": max(15, 115 - el_s)}
+    except Exception:
+        pass
+    return None
+
+
+def run_prompt(graph: dict, timeout: int = RENDER_TIMEOUT_SECONDS, progress_cb=None) -> str:
     try:
         prompt_id = _http("/prompt", {"prompt": graph, "client_id": uuid.uuid4().hex}, timeout=30)["prompt_id"]
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"ComfyUI rejected workflow: {e.read().decode('utf-8', 'replace')[:3000]}") from None
-    deadline = time.time() + timeout
+    t0 = time.time()
+    last_prog_time = 0.0
+    last_prog_key = None
+    deadline = t0 + timeout
     while time.time() < deadline:
         _reset_activity()
+        now = time.time()
+        if progress_cb and (now - last_prog_time >= 4.5):
+            prog = _parse_comfy_progress(t0)
+            if prog:
+                pkey = (prog.get("phase"), prog.get("step"))
+                if pkey != last_prog_key or (now - last_prog_time >= 10.0):
+                    last_prog_key = pkey
+                    last_prog_time = now
+                    try:
+                        progress_cb(prog)
+                    except Exception:
+                        pass
         try:
             hist = _http(f"/history/{prompt_id}", timeout=10)
         except (urllib.error.URLError, OSError):
@@ -455,10 +534,10 @@ def agent_main():
         raise ValueError("KREA_WORKER_URL and KREA_AGENT_SECRET must be set for agent mode.")
 
     print(f"[krea-agent] Starting Colab Agent for Worker: {worker_url}")
-    bootstrap()
     use_drive = mount_drive()
-    print("[krea-agent] Pre-loading default MOSS-Image models...")
-    ensure_models("moss", "gen", use_drive)
+    bootstrap(use_drive)
+    print("[krea-agent] Pre-loading and caching MOSS-Image models (gen + edit) on Google Drive...")
+    ensure_models("moss", "edit", use_drive)
     start_comfy()
     print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
 
@@ -543,10 +622,28 @@ def agent_main():
                            "3:4": (896, 1152), "3:2": (1216, 832), "2:3": (832, 1216)}
                 width, height = aspects.get(ar, (1024, 1024))
 
+            def send_progress(prog: dict):
+                try:
+                    p_url = f"{worker_url}/agent/progress/{jid}"
+                    p_req = urllib.request.Request(p_url, data=json.dumps(prog).encode("utf-8"), headers=headers, method="POST")
+                    urllib.request.urlopen(p_req, timeout=8)
+                except Exception:
+                    pass
+
+            send_progress({"phase": "Starting sampler on T4 GPU...", "step": 0, "total": steps, "elapsed_s": 1, "eta_s": 25 if engine == "krea2" else 110})
             graph = build_graph(eng, prompt, "", width, height, steps, cfg, seed, edit_image=edit_image)
-            out_file = run_prompt(graph)
+            out_file = run_prompt(graph, progress_cb=send_progress)
+            send_progress({"phase": "Decoding VAE & uploading final PNG...", "step": steps, "total": steps, "elapsed_s": int(time.time() - last_activity), "eta_s": 3})
             with open(out_file, "rb") as f:
                 img_bytes = f.read()
+            if use_drive:
+                try:
+                    drive_out = f"{DRIVE_ROOT}/krea_comfy_outputs/krea_job{jid}_{int(time.time())}.png"
+                    with open(drive_out, "wb") as df:
+                        df.write(img_bytes)
+                    print(f"[krea-agent] Saved backup to Google Drive: {drive_out}")
+                except Exception as de:
+                    print(f"[krea-agent] Drive output backup notice: {de}")
 
             done_url = f"{worker_url}/agent/done/{jid}"
             done_req = urllib.request.Request(done_url, data=img_bytes, headers={
@@ -579,11 +676,11 @@ def main():
         return
     if mode not in MODES or engine not in ENGINES:
         raise ValueError(f"Bad KREA_MODE={mode!r} or KREA_ENGINE={engine!r}")
-    bootstrap()
+    use_drive = ENGINES[engine]["drive_cache"] and mount_drive()
+    bootstrap(use_drive)
     if mode == "probe":
         probe()
         return
-    use_drive = ENGINES[engine]["drive_cache"] and mount_drive()
     ensure_models(engine, mode, use_drive)
     start_comfy()
     if mode == "prefetch":

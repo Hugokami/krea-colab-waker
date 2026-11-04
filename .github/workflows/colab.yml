@@ -37,6 +37,10 @@ jobs:
         run: |
           python colab_pool.py run new -s krea --gpu T4
 
+      - name: Mount Google Drive for Persistent Model & ComfyUI Cache
+        run: |
+          colab drivemount -s krea || echo "Drive mount notice: continuing with session."
+
       - name: Deploy and Start Colab Agent
         env:
           KREA_WORKER_URL: ${{ secrets.KREA_WORKER_URL }}
