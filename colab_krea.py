@@ -1,11 +1,11 @@
 """
 krea-comfy-colab remote engine. Runs inside the persistent Colab kernel via `colab exec -f`.
-Engines : moss  (MOSS-Image SFT BF16 + Qwen 3.5 9B INT8 ConvRot + Flux 2 Full VAE + edit LoRA, Google Drive cached, default)
+Engines : moss  (MOSS-Image SFT BF16 + Qwen 3.5 9B INT8 ConvRot + Flux 2 Full VAE + 8-Step DMD Turbo LoRA, Google Drive cached, default)
           krea2 (Krea 2 Turbo INT8 ConvRot + Qwen 3 VL 4B BF16 + Qwen Image VAE, Google Drive cached)
-Modes   : gen | edit | ui | probe | prefetch                       (env KREA_MODE)
+          idol  (Idol-SDK 600M 3D-DiT: Single-image to 3D Gaussian Splats .ply reconstruction)
+Modes   : gen | edit | 3d | ui | probe | prefetch                   (env KREA_MODE)
 Inputs  : KREA_* env vars; free text is Base64 UTF-8 (KREA_PROMPT_B64 / KREA_NEG_B64)
-Output  : /content/krea_out.png + stdout markers KREA_COMPLETE: / KREA_UI_URL: / KREA_READY:
-All side effects live in main(); importing this module locally is safe (test_krea.py).
+Output  : /content/krea_out.png or /content/krea_out.ply
 """
 import builtins
 import os
@@ -35,6 +35,7 @@ DRIVE_ROOT = "/content/drive/MyDrive"
 DRIVE_CACHE = f"{DRIVE_ROOT}/comfy_cache"
 HF_DL_DIR = "/content/hf_dl"
 OUT_PATH = "/content/krea_out.png"
+OUT_3D_PATH = "/content/krea_out.ply"
 EDIT_INPUT_NAME = "krea_edit_input.png"
 CLOUDFLARED = "/content/cloudflared"
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -42,9 +43,16 @@ CLOUDFLARED_LOG = "/content/cloudflared.log"
 TUNNEL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 IDLE_TIMEOUT_SECONDS = 1500  # 25 minutes
 RENDER_TIMEOUT_SECONDS = 1500
-MODES = ("gen", "edit", "ui", "probe", "prefetch", "agent")
+MODES = ("gen", "edit", "3d", "ui", "probe", "prefetch", "agent")
 ENV_KEYS = ("KREA_MODE", "KREA_ENGINE", "KREA_PROMPT_B64", "KREA_NEG_B64", "KREA_W", "KREA_H",
-            "KREA_STEPS", "KREA_CFG", "KREA_SEED", "KREA_INPUT", "KREA_STRENGTH", "KREA_DENOISE")
+            "KREA_STEPS", "KREA_CFG", "KREA_SEED", "KREA_INPUT", "KREA_STRENGTH", "KREA_DENOISE",
+            "KREA_FAST", "KREA_LORA", "KREA_RES")
+
+MOSS_DMD_REPO = "lodestones/MOSS-Image-SFT-8-steps-dmd"
+MOSS_DMD_REMOTE = "lora.safetensors"
+MOSS_DMD_LORA = "moss_image_sft_8step_dmd.safetensors"
+IDOL_REPO = "https://github.com/speridlabs/idol-sdk.git"
+IDOL_DIR = "/content/idol-sdk"
 
 # High-precision production engines cached permanently on Google Drive (>1 TB storage)
 ENGINES = {
@@ -55,6 +63,7 @@ ENGINES = {
         "vae": "flux2-vae.safetensors",
         "edit_lora": "moss_image_edit_lora_rank_64_bf16.safetensors",
         "control_lora": "moss_image_color_depth_control.safetensors",
+        "dmd_lora": MOSS_DMD_LORA,
         "clip_type": "moss_image",
         "steps": 35, "cfg": 4.0, "sampler": "euler", "scheduler": "simple",
         "drive_cache": True,
@@ -81,6 +90,7 @@ MODEL_DIRS = {
     "control_lora": "loras",
     "style_lora": "loras",
     "turbo_lora": "loras",
+    "dmd_lora": "loras",
     "geometry": "geometry_estimation",
 }
 
@@ -153,7 +163,7 @@ def edit_dims(w: int, h: int, max_pixels: int = 1024 * 1024, multiple: int = 16)
 
 def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, steps: int, cfg: float,
                 seed: int, edit_image: str | None = None, lora_strength: float = 1.0, denoise: float = 1.0,
-                lora_name: str | None = None) -> dict:
+                lora_name: str | None = None, dmd_lora: str | None = None) -> dict:
     """ComfyUI API-format workflow. Node ids 1-9 are fixed; test_krea.py asserts on them."""
     g = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": "default"}},
@@ -181,6 +191,12 @@ def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, 
         model, pos, neg = ["10", 0], ["13", 0], ["14", 0]
         if denoise < 1.0:
             latent = ["12", 0]  # img2img start from source image
+
+    # 8-step DMD Turbo LoRA acceleration (3.5x speedup)
+    if dmd_lora:
+        g["16"] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": dmd_lora, "strength_model": 1.0}}
+        model = ["16", 0]
 
     g["7"] = {"class_type": "KSampler", "inputs": {
         "model": model, "seed": seed, "steps": steps, "cfg": cfg,
@@ -357,7 +373,7 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         _reset_activity()
 
 
-def ensure_lora(repo: str, lora_name: str, use_drive: bool):
+def ensure_lora(repo: str, lora_name: str, use_drive: bool, remote_name: str | None = None):
     """Download / stage a single LoRA model directly to models/loras."""
     target = f"{COMFY_DIR}/models/loras/{lora_name}"
     if _size(target) > 0:
@@ -369,19 +385,52 @@ def ensure_lora(repo: str, lora_name: str, use_drive: bool):
         _atomic_copy(cached, target)
         return
     index = repo_index(repo)
-    repo_path = resolve_repo_path(index, lora_name)
+    lookup = remote_name or lora_name
+    repo_path = resolve_repo_path(index, lookup)
     if not repo_path:
-        print(f"[krea] Warning: LoRA {lora_name} not found in {repo}")
+        print(f"[krea] Warning: LoRA {lookup} not found in {repo}")
         return
-    print(f"[krea] Downloading LoRA {lora_name} ({index[repo_path] / 1e6:.1f} MB) ...")
+    print(f"[krea] Downloading LoRA {lora_name} from {repo}/{repo_path} ({index[repo_path] / 1e6:.1f} MB) ...")
     from huggingface_hub import hf_hub_download
-    os.replace(hf_hub_download(repo, repo_path, local_dir=HF_DL_DIR), target)
+    dl = hf_hub_download(repo, repo_path, local_dir=HF_DL_DIR)
+    _atomic_copy(dl, target)
     if use_drive:
         try:
             _atomic_copy(target, cached)
             print(f"[krea] Cached {lora_name} to Google Drive: {cached}")
         except Exception as e:
             print(f"[krea] Drive cache notice: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Idol-SDK 3D Object Reconstruction (.ply Gaussian Splats)
+# ---------------------------------------------------------------------------
+def bootstrap_idol(use_drive: bool = False):
+    if os.path.isdir(IDOL_DIR):
+        return
+    print("[krea] Installing idol-sdk for 3D Gaussian Splat reconstruction...")
+    subprocess.run(["git", "clone", "--depth", "1", IDOL_REPO, IDOL_DIR], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "."], cwd=IDOL_DIR, check=True)
+
+
+def run_idol_3d(input_image: str, prompt: str = "real", use_drive: bool = False) -> str:
+    bootstrap_idol(use_drive)
+    try:
+        _http("/free", {"unload_models": True, "free_memory": True}, timeout=10)
+    except Exception:
+        pass
+    out_dir = "/content/idol_out"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+    mode_param = "anime" if "anime" in prompt.lower() else "real"
+    cmd = [sys.executable, "-m", "idol.sample", "--image", input_image, "--mode", mode_param, "--out", out_dir]
+    print(f"[krea-3d] Running Idol-SDK: {' '.join(cmd)}")
+    subprocess.run(cmd, cwd=IDOL_DIR, check=True)
+    ply_files = [os.path.join(r, f) for r, _, fs in os.walk(out_dir) if f.endswith(".ply")]
+    if not ply_files:
+        raise RuntimeError("Idol-SDK finished without producing a .ply file.")
+    _atomic_copy(ply_files[0], OUT_3D_PATH)
+    return OUT_3D_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +502,7 @@ def _parse_comfy_progress(t0: float, default_total: int = 35) -> dict | None:
                 el_s = _parse_mmss(m.group(3)) or int(time.time() - t0)
                 eta_raw = m.group(4)
                 if "?" in eta_raw or step == 0:
-                    eta_s = max(5, int((total - step) * 4.2))
+                    eta_s = max(5, int((total - step) * 3.5))
                 else:
                     eta_s = _parse_mmss(eta_raw)
                 phase = "Loading models into T4 GPU VRAM..." if step == 0 else "Denoising on T4 GPU"
@@ -522,25 +571,59 @@ def prepare_edit_input(src: str) -> tuple[int, int]:
     return w, h
 
 
-def render(engine: str, mode: str, env: dict):
+def render(engine: str, mode: str, env: dict, use_drive: bool = False):
+    if mode == "3d":
+        print(f"[krea] Generating 3D object from {env.get('KREA_INPUT')} via Idol-SDK...")
+        out_ply = run_idol_3d(env["KREA_INPUT"], b64d(env["KREA_PROMPT_B64"]), use_drive)
+        print(f"KREA_COMPLETE:{out_ply}")
+        return
+
     eng = ENGINES[engine]
     if os.path.exists(OUT_PATH):
         os.remove(OUT_PATH)
     prompt = b64d(env["KREA_PROMPT_B64"]).strip()
     if not prompt:
         raise ValueError("Prompt/instruction cannot be empty.")
-    steps = int(env["KREA_STEPS"] or eng["steps"])
-    cfg = float(env["KREA_CFG"] or eng["cfg"])
+    
+    is_fast = bool(env.get("KREA_FAST") in ("1", "true", "True"))
+    dmd_lora = None
+
+    if engine == "moss":
+        if is_fast:
+            ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+            dmd_lora = MOSS_DMD_LORA
+            steps = int(env["KREA_STEPS"] or 8)
+            cfg = float(env["KREA_CFG"] or 1.0)
+        else:
+            steps = int(env["KREA_STEPS"] or 35)
+            cfg = float(env["KREA_CFG"] or 4.0)
+    else:
+        steps = int(env["KREA_STEPS"] or (8 if is_fast else 12))
+        cfg = float(env["KREA_CFG"] or 1.0)
+
     seed = int(env["KREA_SEED"]) if env["KREA_SEED"] else random.randint(0, 2**32 - 1)
     edit_image = None
     if mode == "edit":
         width, height = prepare_edit_input(env["KREA_INPUT"])
         edit_image = EDIT_INPUT_NAME
     else:
-        width, height = int(env["KREA_W"] or 1024), int(env["KREA_H"] or 1024)
+        res_tier = env.get("KREA_RES", "1mp")
+        res_dict = RESOLUTIONS.get(res_tier, RESOLUTIONS["1mp"])
+        ar = f"{env.get('KREA_W', '1024')}:{env.get('KREA_H', '1024')}"
+        width = int(env["KREA_W"] or 1024)
+        height = int(env["KREA_H"] or 1024)
+
+    lora_name = env.get("KREA_LORA") or None
+    if lora_name and lora_name in STYLE_LORAS:
+        lora_file, trigger = STYLE_LORAS[lora_name]
+        ensure_lora("Comfy-Org/Krea-2", lora_file, use_drive)
+        lora_name = lora_file
+        if trigger.lower() not in prompt.lower():
+            prompt = f"{trigger}, {prompt}"
+
     graph = build_graph(eng, prompt, b64d(env["KREA_NEG_B64"]), width, height, steps, cfg, seed,
                         edit_image=edit_image, lora_strength=float(env["KREA_STRENGTH"] or 1.0),
-                        denoise=float(env["KREA_DENOISE"] or 1.0))
+                        denoise=float(env["KREA_DENOISE"] or 1.0), lora_name=lora_name, dmd_lora=dmd_lora)
     errors = validate_graph(graph, object_info(), eng["clip_type"])
     if errors:
         raise RuntimeError("\n".join(errors))
@@ -677,16 +760,65 @@ def agent_main():
         print(f"\n[krea-agent] Claimed job {jid}: {engine} {mode} (AR={ar}, Res={res_tier}, Quality={quality_mode}, LoRA={lora_mode})\nPrompt: {prompt}")
 
         try:
+            def send_progress(prog: dict):
+                try:
+                    p_url = f"{worker_url}/agent/progress/{jid}"
+                    p_req = urllib.request.Request(p_url, data=json.dumps(prog).encode("utf-8"), headers=headers, method="POST")
+                    urllib.request.urlopen(p_req, timeout=8)
+                except Exception:
+                    pass
+
+            # Handle 3D object reconstruction via Idol-SDK
+            if mode == "3d":
+                input_url = f"{worker_url}/agent/input/{jid}"
+                in_req = urllib.request.Request(input_url, headers={
+                    "Authorization": f"Bearer {agent_secret}",
+                    "User-Agent": ua,
+                })
+                local_in = f"{COMFY_DIR}/input/idol_in_{jid}.png"
+                os.makedirs(f"{COMFY_DIR}/input", exist_ok=True)
+                with urllib.request.urlopen(in_req, timeout=60) as r, open(local_in, "wb") as f:
+                    f.write(r.read())
+
+                send_progress({"phase": "Reconstructing 3D Gaussian Splats (Idol-SDK)...", "step": 1, "total": 2, "elapsed_s": 1, "eta_s": 12})
+                ply_path = run_idol_3d(local_in, prompt, use_drive)
+                send_progress({"phase": "Uploading 3D .ply model to Telegram...", "step": 2, "total": 2, "elapsed_s": int(time.time() - last_activity), "eta_s": 2})
+
+                with open(ply_path, "rb") as f:
+                    ply_bytes = f.read()
+
+                done_url = f"{worker_url}/agent/done/{jid}"
+                done_req = urllib.request.Request(done_url, data=ply_bytes, headers={
+                    "Authorization": f"Bearer {agent_secret}",
+                    "Content-Type": "application/octet-stream",
+                    "User-Agent": ua,
+                }, method="POST")
+                with urllib.request.urlopen(done_req, timeout=60) as r:
+                    print(f"[krea-agent] 3D Job {jid} delivered to Telegram successfully!")
+                last_activity = time.time()
+                continue
+
+            # 2D Image Generation & Editing
             ensure_models(engine, mode, use_drive)
             eng = ENGINES[engine]
+            dmd_lora = None
 
             # Determine steps & CFG by quality preset
             if engine == "moss":
-                steps = 35 if quality_mode == "quality" else 20
-                cfg = 4.0
+                if quality_mode == "fast":
+                    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+                    dmd_lora = MOSS_DMD_LORA
+                    steps = 8
+                    cfg = 1.0
+                    est_time = 28
+                else:
+                    steps = 35
+                    cfg = 4.0
+                    est_time = 115
             else:
-                steps = 12 if quality_mode == "quality" else 8
+                steps = 8 if quality_mode == "fast" else 12
                 cfg = 1.0
+                est_time = 25
 
             seed = random.randint(0, 2**32 - 1)
             edit_image = None
@@ -716,19 +848,10 @@ def agent_main():
                 res_dict = RESOLUTIONS.get(res_tier, RESOLUTIONS["1mp"])
                 width, height = res_dict.get(ar, (1024, 1024))
 
-            def send_progress(prog: dict):
-                try:
-                    p_url = f"{worker_url}/agent/progress/{jid}"
-                    p_req = urllib.request.Request(p_url, data=json.dumps(prog).encode("utf-8"), headers=headers, method="POST")
-                    urllib.request.urlopen(p_req, timeout=8)
-                except Exception:
-                    pass
-
-            est_time = 30 if engine == "krea2" else (120 if quality_mode == "quality" else 75)
             send_progress({"phase": f"Starting {engine.upper()} on T4 GPU...", "step": 0, "total": steps, "elapsed_s": 1, "eta_s": est_time})
 
             graph = build_graph(eng, prompt, "", width, height, steps, cfg, seed,
-                                edit_image=edit_image, lora_name=lora_name)
+                                edit_image=edit_image, lora_name=lora_name, dmd_lora=dmd_lora)
             out_file = run_prompt(graph, progress_cb=send_progress)
             send_progress({"phase": "Decoding full VAE & uploading PNG...", "step": steps, "total": steps, "elapsed_s": int(time.time() - last_activity), "eta_s": 3})
 
@@ -773,21 +896,22 @@ def main():
     if mode == "agent":
         agent_main()
         return
-    if mode not in MODES or engine not in ENGINES:
+    if mode not in MODES or (mode != "3d" and engine not in ENGINES):
         raise ValueError(f"Bad KREA_MODE={mode!r} or KREA_ENGINE={engine!r}")
-    use_drive = ENGINES[engine]["drive_cache"] and mount_drive()
+    use_drive = (mode == "3d" or ENGINES[engine]["drive_cache"]) and mount_drive()
     bootstrap(use_drive)
     if mode == "probe":
         probe()
         return
-    ensure_models(engine, mode, use_drive)
+    if mode != "3d":
+        ensure_models(engine, mode, use_drive)
     start_comfy()
     if mode == "prefetch":
         print(f"KREA_READY:{engine}")
     elif mode == "ui":
         print(f"KREA_UI_URL:{start_tunnel()}")
     else:
-        render(engine, mode, env)
+        render(engine, mode, env, use_drive=use_drive)
     _reset_activity()
 
 
