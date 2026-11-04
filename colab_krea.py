@@ -7,12 +7,17 @@ Inputs  : KREA_* env vars; free text is Base64 UTF-8 (KREA_PROMPT_B64 / KREA_NEG
 Output  : /content/krea_out.png + stdout markers KREA_COMPLETE: / KREA_UI_URL: / KREA_READY:
 All side effects live in main(); importing this module locally is safe (test_krea.py).
 """
+import builtins
 import os
 import re
 import sys
 import json
 import time
 import uuid
+
+_orig_print = builtins.print
+builtins.print = lambda *a, **k: _orig_print(*a, **dict(k, flush=True))
+
 import base64
 import random
 import shutil
@@ -458,9 +463,13 @@ def agent_main():
     print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
 
     last_activity = time.time()
+    last_hb = 0.0
+    last_err = 0.0
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     headers = {
         "Authorization": f"Bearer {agent_secret}",
         "Content-Type": "application/json",
+        "User-Agent": ua,
     }
 
     while True:
@@ -479,7 +488,13 @@ def agent_main():
             req = urllib.request.Request(f"{worker_url}/agent/next", data=b"{}", headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=15) as r:
                 res = json.loads(r.read().decode("utf-8"))
-        except Exception:
+            if time.time() - last_hb > 60:
+                print(f"[krea-agent] Heartbeat active ({time.strftime('%H:%M:%S')}) - listening for Telegram jobs...")
+                last_hb = time.time()
+        except Exception as e:
+            if time.time() - last_err > 15:
+                print(f"[krea-agent] Poll error: {e}")
+                last_err = time.time()
             continue
 
         if res.get("stop"):
@@ -513,7 +528,10 @@ def agent_main():
 
             if mode == "edit":
                 input_url = f"{worker_url}/agent/input/{jid}"
-                in_req = urllib.request.Request(input_url, headers={"Authorization": f"Bearer {agent_secret}"})
+                in_req = urllib.request.Request(input_url, headers={
+                    "Authorization": f"Bearer {agent_secret}",
+                    "User-Agent": ua,
+                })
                 local_in = f"{COMFY_DIR}/input/{EDIT_INPUT_NAME}"
                 os.makedirs(f"{COMFY_DIR}/input", exist_ok=True)
                 with urllib.request.urlopen(in_req, timeout=60) as r, open(local_in, "wb") as f:
@@ -534,6 +552,7 @@ def agent_main():
             done_req = urllib.request.Request(done_url, data=img_bytes, headers={
                 "Authorization": f"Bearer {agent_secret}",
                 "Content-Type": "image/png",
+                "User-Agent": ua,
             }, method="POST")
             with urllib.request.urlopen(done_req, timeout=60) as r:
                 print(f"[krea-agent] Job {jid} delivered to Telegram successfully!")
