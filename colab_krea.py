@@ -1,7 +1,7 @@
 """
 krea-comfy-colab remote engine. Runs inside the persistent Colab kernel via `colab exec -f`.
-Engines : moss  (MOSS-Image SFT INT8 + official edit LoRA, Google Drive cached, default)
-          krea2 (Krea 2 Turbo FP8, Colab SSD only: ~18 GB exceeds 15 GB free Drive)
+Engines : moss  (MOSS-Image SFT BF16 + Qwen 3.5 9B INT8 ConvRot + Flux 2 Full VAE + edit LoRA, Google Drive cached, default)
+          krea2 (Krea 2 Turbo INT8 ConvRot + Qwen 3 VL 4B BF16 + Qwen Image VAE, Google Drive cached)
 Modes   : gen | edit | ui | probe | prefetch                       (env KREA_MODE)
 Inputs  : KREA_* env vars; free text is Base64 UTF-8 (KREA_PROMPT_B64 / KREA_NEG_B64)
 Output  : /content/krea_out.png + stdout markers KREA_COMPLETE: / KREA_UI_URL: / KREA_READY:
@@ -46,30 +46,70 @@ MODES = ("gen", "edit", "ui", "probe", "prefetch", "agent")
 ENV_KEYS = ("KREA_MODE", "KREA_ENGINE", "KREA_PROMPT_B64", "KREA_NEG_B64", "KREA_W", "KREA_H",
             "KREA_STEPS", "KREA_CFG", "KREA_SEED", "KREA_INPUT", "KREA_STRENGTH", "KREA_DENOISE")
 
-# Filenames from concepts_brief.md. `krea-colab probe` checks them against the live HF repo.
+# High-precision production engines cached permanently on Google Drive (>1 TB storage)
 ENGINES = {
     "moss": {
         "repo": "Comfy-Org/MOSS-Image",
-        "unet": "moss_image_sft_int8_convrot.safetensors",
-        "clip": "qwen3.5_9b_w4a8_gptq.safetensors",
-        "vae": "flux2-vae_small.safetensors",
+        "unet": "moss_image_sft_bf16.safetensors",
+        "clip": "qwen3.5_9b_int8_convrot.safetensors",
+        "vae": "flux2-vae.safetensors",
         "edit_lora": "moss_image_edit_lora_rank_64_bf16.safetensors",
+        "control_lora": "moss_image_color_depth_control.safetensors",
         "clip_type": "moss_image",
-        "steps": 28, "cfg": 4.0, "sampler": "euler", "scheduler": "simple",
+        "steps": 35, "cfg": 4.0, "sampler": "euler", "scheduler": "simple",
         "drive_cache": True,
     },
     "krea2": {
         "repo": "Comfy-Org/Krea-2",
-        "unet": "krea2_turbo_fp8_scaled.safetensors",
-        "clip": "qwen3vl_4b_fp8_scaled.safetensors",
+        "unet": "krea2_turbo_int8_convrot.safetensors",
+        "clip": "qwen3vl_4b_bf16.safetensors",
         "vae": "qwen_image_vae.safetensors",
-        "edit_lora": "krea2_identity_edit.safetensors",
+        "edit_lora": "krea2_style_reference.safetensors",
+        "style_lora": "krea2_style_reference.safetensors",
+        "turbo_lora": "krea2_turbo_lora_rank_64_bf16.safetensors",
         "clip_type": "qwen_image",
         "steps": 8, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
-        "drive_cache": False,
+        "drive_cache": True,
     },
 }
-MODEL_DIRS = {"unet": "diffusion_models", "clip": "text_encoders", "vae": "vae", "edit_lora": "loras"}
+
+MODEL_DIRS = {
+    "unet": "diffusion_models",
+    "clip": "text_encoders",
+    "vae": "vae",
+    "edit_lora": "loras",
+    "control_lora": "loras",
+    "style_lora": "loras",
+    "turbo_lora": "loras",
+    "geometry": "geometry_estimation",
+}
+
+RESOLUTIONS = {
+    "1mp": {
+        "1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344),
+        "4:3": (1152, 896), "3:4": (896, 1152), "3:2": (1216, 832), "2:3": (832, 1216),
+    },
+    "1.5mp": {
+        "1:1": (1280, 1280), "16:9": (1600, 896), "9:16": (896, 1600),
+        "4:3": (1408, 1056), "3:4": (1056, 1408), "3:2": (1504, 1008), "2:3": (1008, 1504),
+    },
+    "2k": {
+        "1:1": (1440, 1440), "16:9": (1920, 1088), "9:16": (1088, 1920),
+        "4:3": (1664, 1248), "3:4": (1248, 1664), "3:2": (1760, 1168), "2:3": (1168, 1760),
+    },
+}
+
+STYLE_LORAS = {
+    "darkbrush": ("krea2_darkbrush.safetensors", "monochrome ink wash style"),
+    "dotmatrix": ("krea2_dotmatrix.safetensors", "monochrome stippling style"),
+    "kidsdrawing": ("krea2_kidsdrawing.safetensors", "naive expressive sketch style"),
+    "neondrip": ("krea2_neondrip.safetensors", "textured abstract style"),
+    "rainywindow": ("krea2_rainywindow.safetensors", "rainy window style"),
+    "retroanime": ("krea2_retroanime.safetensors", "purple retro anime style"),
+    "softwatercolor": ("krea2_softwatercolor.safetensors", "art deco watercolor style"),
+    "sunsetblur": ("krea2_sunsetblur.safetensors", "ethereal motion blur style"),
+    "vintagetarot": ("krea2_vintagetarot.safetensors", "vintage tarot style"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +152,9 @@ def edit_dims(w: int, h: int, max_pixels: int = 1024 * 1024, multiple: int = 16)
 
 
 def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, steps: int, cfg: float,
-                seed: int, edit_image: str | None = None, lora_strength: float = 1.0, denoise: float = 1.0) -> dict:
-    """ComfyUI API-format workflow. Node ids are fixed; test_krea.py asserts on them."""
+                seed: int, edit_image: str | None = None, lora_strength: float = 1.0, denoise: float = 1.0,
+                lora_name: str | None = None) -> dict:
+    """ComfyUI API-format workflow. Node ids 1-9 are fixed; test_krea.py asserts on them."""
     g = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": eng["clip"], "type": eng["clip_type"]}},
@@ -123,6 +164,13 @@ def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, 
         "6": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
     }
     model, pos, neg, latent = ["1", 0], ["4", 0], ["5", 0], ["6", 0]
+
+    # Optional style LoRA
+    if lora_name and not edit_image:
+        g["15"] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model, "lora_name": lora_name, "strength_model": lora_strength}}
+        model = ["15", 0]
+
     if edit_image:
         g["10"] = {"class_type": "LoraLoaderModelOnly",
                    "inputs": {"model": model, "lora_name": eng["edit_lora"], "strength_model": lora_strength}}
@@ -133,6 +181,7 @@ def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, 
         model, pos, neg = ["10", 0], ["13", 0], ["14", 0]
         if denoise < 1.0:
             latent = ["12", 0]  # img2img start from source image
+
     g["7"] = {"class_type": "KSampler", "inputs": {
         "model": model, "seed": seed, "steps": steps, "cfg": cfg,
         "sampler_name": eng["sampler"], "scheduler": eng["scheduler"],
@@ -308,6 +357,33 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         _reset_activity()
 
 
+def ensure_lora(repo: str, lora_name: str, use_drive: bool):
+    """Download / stage a single LoRA model directly to models/loras."""
+    target = f"{COMFY_DIR}/models/loras/{lora_name}"
+    if _size(target) > 0:
+        return
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    cached = f"{DRIVE_CACHE}/{lora_name}"
+    if use_drive and _size(cached) > 10_000_000 and not os.path.exists(cached + ".part"):
+        print(f"[krea] Google Drive cache hit: {lora_name} -> staging to SSD...")
+        _atomic_copy(cached, target)
+        return
+    index = repo_index(repo)
+    repo_path = resolve_repo_path(index, lora_name)
+    if not repo_path:
+        print(f"[krea] Warning: LoRA {lora_name} not found in {repo}")
+        return
+    print(f"[krea] Downloading LoRA {lora_name} ({index[repo_path] / 1e6:.1f} MB) ...")
+    from huggingface_hub import hf_hub_download
+    os.replace(hf_hub_download(repo, repo_path, local_dir=HF_DL_DIR), target)
+    if use_drive:
+        try:
+            _atomic_copy(target, cached)
+            print(f"[krea] Cached {lora_name} to Google Drive: {cached}")
+        except Exception as e:
+            print(f"[krea] Drive cache notice: {e}")
+
+
 # ---------------------------------------------------------------------------
 # ComfyUI server, rendering, tunnel
 # ---------------------------------------------------------------------------
@@ -360,7 +436,7 @@ def _parse_mmss(s: str) -> int:
     return 0
 
 
-def _parse_comfy_progress(t0: float, default_total: int = 28) -> dict | None:
+def _parse_comfy_progress(t0: float, default_total: int = 35) -> dict | None:
     try:
         if not os.path.isfile(COMFY_LOG):
             return None
@@ -377,7 +453,7 @@ def _parse_comfy_progress(t0: float, default_total: int = 28) -> dict | None:
                 el_s = _parse_mmss(m.group(3)) or int(time.time() - t0)
                 eta_raw = m.group(4)
                 if "?" in eta_raw or step == 0:
-                    eta_s = max(5, int((total - step) * 4.8))
+                    eta_s = max(5, int((total - step) * 4.2))
                 else:
                     eta_s = _parse_mmss(eta_raw)
                 phase = "Loading models into T4 GPU VRAM..." if step == 0 else "Denoising on T4 GPU"
@@ -402,7 +478,7 @@ def run_prompt(graph: dict, timeout: int = RENDER_TIMEOUT_SECONDS, progress_cb=N
     while time.time() < deadline:
         _reset_activity()
         now = time.time()
-        if progress_cb and (now - last_prog_time >= 4.5):
+        if progress_cb and (now - last_prog_time >= 4.0):
             prog = _parse_comfy_progress(t0)
             if prog:
                 pkey = (prog.get("phase"), prog.get("step"))
@@ -504,8 +580,6 @@ def probe():
         mem = {ln.split(":")[0]: int(ln.split()[1]) // 1024 for ln in f if ln.startswith(("MemTotal", "MemAvailable"))}
     print(f"[krea] RAM MB {mem} | /content free {shutil.disk_usage('/content').free / 1e9:.0f} GB"
           f" | Drive mounted: {mount_drive()}")
-    if mem.get("MemTotal", 0) < 14000:
-        print("[krea] NOTE: <14 GB system RAM; krea2 (~13 GB diffusion file) may be OOM-killed while loading.")
     start_comfy()
     info = object_info()
     for name, eng in ENGINES.items():
@@ -519,9 +593,10 @@ def probe():
             continue
         missing = False
         for key in MODEL_DIRS:
-            path = resolve_repo_path(index, eng[key])
-            missing |= path is None
-            print(f"  [{name}] {key:<9} {'OK ' + path if path else 'MISSING ' + eng[key]}")
+            if key in eng:
+                path = resolve_repo_path(index, eng[key])
+                missing |= path is None
+                print(f"  [{name}] {key:<9} {'OK ' + path if path else 'MISSING ' + eng[key]}")
         if missing:
             print(f"  [{name}] repo .safetensors: {sorted(p for p in index if p.endswith('.safetensors'))}")
     print("KREA_PROBE_DONE")
@@ -536,7 +611,7 @@ def agent_main():
     print(f"[krea-agent] Starting Colab Agent for Worker: {worker_url}")
     use_drive = mount_drive()
     bootstrap(use_drive)
-    print("[krea-agent] Pre-loading and caching MOSS-Image models (gen + edit) on Google Drive...")
+    print("[krea-agent] Pre-loading and caching MOSS-Image BF16 models (gen + edit) on Google Drive...")
     ensure_models("moss", "edit", use_drive)
     start_comfy()
     print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
@@ -594,16 +669,36 @@ def agent_main():
         mode = job["mode"]
         engine = job.get("engine", "moss")
         ar = job.get("ar", "1:1")
+        res_tier = job.get("res", "1mp")
+        quality_mode = job.get("quality", "quality")
+        lora_mode = job.get("lora", "none")
         prompt = job["prompt"]
-        print(f"\n[krea-agent] Claimed job {jid}: {engine} {mode} ({ar})\nPrompt: {prompt}")
+
+        print(f"\n[krea-agent] Claimed job {jid}: {engine} {mode} (AR={ar}, Res={res_tier}, Quality={quality_mode}, LoRA={lora_mode})\nPrompt: {prompt}")
 
         try:
             ensure_models(engine, mode, use_drive)
             eng = ENGINES[engine]
-            steps = eng["steps"]
-            cfg = eng["cfg"]
+
+            # Determine steps & CFG by quality preset
+            if engine == "moss":
+                steps = 35 if quality_mode == "quality" else 20
+                cfg = 4.0
+            else:
+                steps = 12 if quality_mode == "quality" else 8
+                cfg = 1.0
+
             seed = random.randint(0, 2**32 - 1)
             edit_image = None
+            lora_name = None
+
+            # Handle style LoRA
+            if lora_mode != "none" and lora_mode in STYLE_LORAS:
+                lora_file, trigger = STYLE_LORAS[lora_mode]
+                ensure_lora("Comfy-Org/Krea-2", lora_file, use_drive)
+                lora_name = lora_file
+                if trigger.lower() not in prompt.lower():
+                    prompt = f"{trigger}, {prompt}"
 
             if mode == "edit":
                 input_url = f"{worker_url}/agent/input/{jid}"
@@ -618,9 +713,8 @@ def agent_main():
                 width, height = prepare_edit_input(local_in)
                 edit_image = EDIT_INPUT_NAME
             else:
-                aspects = {"1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344), "4:3": (1152, 896),
-                           "3:4": (896, 1152), "3:2": (1216, 832), "2:3": (832, 1216)}
-                width, height = aspects.get(ar, (1024, 1024))
+                res_dict = RESOLUTIONS.get(res_tier, RESOLUTIONS["1mp"])
+                width, height = res_dict.get(ar, (1024, 1024))
 
             def send_progress(prog: dict):
                 try:
@@ -630,12 +724,17 @@ def agent_main():
                 except Exception:
                     pass
 
-            send_progress({"phase": "Starting sampler on T4 GPU...", "step": 0, "total": steps, "elapsed_s": 1, "eta_s": 25 if engine == "krea2" else 110})
-            graph = build_graph(eng, prompt, "", width, height, steps, cfg, seed, edit_image=edit_image)
+            est_time = 30 if engine == "krea2" else (120 if quality_mode == "quality" else 75)
+            send_progress({"phase": f"Starting {engine.upper()} on T4 GPU...", "step": 0, "total": steps, "elapsed_s": 1, "eta_s": est_time})
+
+            graph = build_graph(eng, prompt, "", width, height, steps, cfg, seed,
+                                edit_image=edit_image, lora_name=lora_name)
             out_file = run_prompt(graph, progress_cb=send_progress)
-            send_progress({"phase": "Decoding VAE & uploading final PNG...", "step": steps, "total": steps, "elapsed_s": int(time.time() - last_activity), "eta_s": 3})
+            send_progress({"phase": "Decoding full VAE & uploading PNG...", "step": steps, "total": steps, "elapsed_s": int(time.time() - last_activity), "eta_s": 3})
+
             with open(out_file, "rb") as f:
                 img_bytes = f.read()
+
             if use_drive:
                 try:
                     drive_out = f"{DRIVE_ROOT}/krea_comfy_outputs/krea_job{jid}_{int(time.time())}.png"
