@@ -1,0 +1,47 @@
+name: Wake Colab Agent
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: colab-runner
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install google-colab-cli
+        run: |
+          pip install --no-cache-dir google-colab-cli
+
+      - name: Configure Colab credentials
+        env:
+          COLAB_ACCOUNT_B64: ${{ secrets.COLAB_ACCOUNT_B64 }}
+        run: |
+          mkdir -p ~/.config/colab-cli
+          echo "$COLAB_ACCOUNT_B64" | base64 -d > ~/.config/colab-cli/token.json
+
+      - name: Allocate Colab T4 GPU Session
+        run: |
+          colab new -s krea --gpu T4 || echo "Session already active or assigned."
+
+      - name: Deploy and Start Colab Agent
+        env:
+          KREA_WORKER_URL: ${{ secrets.KREA_WORKER_URL }}
+          KREA_AGENT_SECRET: ${{ secrets.KREA_AGENT_SECRET }}
+        run: |
+          colab upload colab_krea.py /content/colab_krea.py -s krea
+          colab exec -s krea -f colab_krea.py \
+            --env KREA_MODE=agent \
+            --env KREA_WORKER_URL="$KREA_WORKER_URL" \
+            --env KREA_AGENT_SECRET="$KREA_AGENT_SECRET" \
+            --timeout 14400
