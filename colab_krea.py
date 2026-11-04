@@ -71,7 +71,7 @@ ENGINES = {
     "krea2": {
         "repo": "Comfy-Org/Krea-2",
         "unet": "krea2_turbo_int8_convrot.safetensors",
-        "clip": "qwen3vl_4b_bf16.safetensors",
+        "clip": "qwen3vl_4b_int8_convrot.safetensors",
         "vae": "qwen_image_vae.safetensors",
         "edit_lora": "krea2_style_reference.safetensors",
         "style_lora": "krea2_style_reference.safetensors",
@@ -331,7 +331,7 @@ def _atomic_copy(src: str, dst: str):
         raise
 
 
-def ensure_models(engine: str, mode: str, use_drive: bool):
+def ensure_models(engine: str, mode: str, use_drive: bool, progress_cb=None):
     """SSD target present -> done. Else fast Google Drive cache hit -> else HF download (+ cache to Drive)."""
     eng = ENGINES[engine]
     index = None
@@ -344,6 +344,11 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         cached = f"{DRIVE_CACHE}/{name}"
         if use_drive and _size(cached) > 10_000_000 and not os.path.exists(cached + ".part"):
             print(f"[krea] Google Drive cache hit: {name} ({_size(cached) / 1e9:.2f} GB) -> staging to SSD...")
+            if progress_cb:
+                try:
+                    progress_cb({"phase": f"Staging {name} from Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 15})
+                except Exception:
+                    pass
             _atomic_copy(cached, target)
             _reset_activity()
             continue
@@ -358,13 +363,29 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
             raise RuntimeError(msg)
         if use_drive and _size(cached) == index[repo_path]:
             print(f"[krea] Google Drive cache hit: {name}")
+            if progress_cb:
+                try:
+                    progress_cb({"phase": f"Staging {name} from Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 15})
+                except Exception:
+                    pass
             _atomic_copy(cached, target)
             continue
-        print(f"[krea] Downloading {repo_path} ({index[repo_path] / 1e9:.2f} GB) ...")
+        sz_gb = index[repo_path] / 1e9
+        print(f"[krea] Downloading {repo_path} ({sz_gb:.2f} GB) ...")
+        if progress_cb:
+            try:
+                progress_cb({"phase": f"Downloading {name} ({sz_gb:.1f} GB)...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": int(sz_gb * 20)})
+            except Exception:
+                pass
         from huggingface_hub import hf_hub_download
         os.replace(hf_hub_download(eng["repo"], repo_path, local_dir=HF_DL_DIR), target)
-        if use_drive:
+        if use_drive and _size(target) <= 11_000_000_000:
             try:
+                if progress_cb:
+                    try:
+                        progress_cb({"phase": f"Caching {name} to Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 20})
+                    except Exception:
+                        pass
                 print(f"[krea] Saving {name} permanently to Google Drive ({cached}) ...")
                 _atomic_copy(target, cached)
                 print(f"[krea] Cached to Google Drive: {cached}")
@@ -373,7 +394,7 @@ def ensure_models(engine: str, mode: str, use_drive: bool):
         _reset_activity()
 
 
-def ensure_lora(repo: str, lora_name: str, use_drive: bool, remote_name: str | None = None):
+def ensure_lora(repo: str, lora_name: str, use_drive: bool, remote_name: str | None = None, progress_cb=None):
     """Download / stage a single LoRA model directly to models/loras."""
     target = f"{COMFY_DIR}/models/loras/{lora_name}"
     if _size(target) > 0:
@@ -391,6 +412,11 @@ def ensure_lora(repo: str, lora_name: str, use_drive: bool, remote_name: str | N
         print(f"[krea] Warning: LoRA {lookup} not found in {repo}")
         return
     print(f"[krea] Downloading LoRA {lora_name} from {repo}/{repo_path} ({index[repo_path] / 1e6:.1f} MB) ...")
+    if progress_cb:
+        try:
+            progress_cb({"phase": f"Downloading LoRA {lora_name}...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 10})
+        except Exception:
+            pass
     from huggingface_hub import hf_hub_download
     dl = hf_hub_download(repo, repo_path, local_dir=HF_DL_DIR)
     _atomic_copy(dl, target)
@@ -799,14 +825,14 @@ def agent_main():
                 continue
 
             # 2D Image Generation & Editing
-            ensure_models(engine, mode, use_drive)
+            ensure_models(engine, mode, use_drive, progress_cb=send_progress)
             eng = ENGINES[engine]
             dmd_lora = None
 
             # Determine steps & CFG by quality preset
             if engine == "moss":
                 if quality_mode == "fast":
-                    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+                    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE, progress_cb=send_progress)
                     dmd_lora = MOSS_DMD_LORA
                     steps = 8
                     cfg = 1.0
@@ -827,7 +853,7 @@ def agent_main():
             # Handle style LoRA
             if lora_mode != "none" and lora_mode in STYLE_LORAS:
                 lora_file, trigger = STYLE_LORAS[lora_mode]
-                ensure_lora("Comfy-Org/Krea-2", lora_file, use_drive)
+                ensure_lora("Comfy-Org/Krea-2", lora_file, use_drive, progress_cb=send_progress)
                 lora_name = lora_file
                 if trigger.lower() not in prompt.lower():
                     prompt = f"{trigger}, {prompt}"
