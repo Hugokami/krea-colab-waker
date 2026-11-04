@@ -92,27 +92,25 @@ def run_with_fallback(colab_args: list[str]) -> int:
             return 0
 
         err_text = (proc.stderr + " " + proc.stdout).lower()
-        quota_keywords = [
-            "quota",
-            "rate limit",
-            "429",
-            "resourceexhausted",
-            "usage limit",
-            "compute unit",
-            "no available gpu",
-            "backend allocation failed",
-            "allocation refused",
-            "precondition failed",
-            "too many active sessions",
-            "not found",
-        ]
+        if "already exists" in err_text and "new" in colab_args:
+            # Session exists on this account: attempt connect
+            sess_name = "krea"
+            if "-s" in colab_args:
+                idx_s = colab_args.index("-s")
+                if idx_s + 1 < len(colab_args):
+                    sess_name = colab_args[idx_s + 1]
+            print(f"[colab-pool] Session '{sess_name}' already exists on Slot {slot}. Connecting...")
+            conn_cmd = [colab_bin, "connect", "-s", sess_name]
+            conn_proc = subprocess.run(conn_cmd, capture_output=True, text=True)
+            if conn_proc.returncode == 0:
+                print(f"[colab-pool] Connected successfully to '{sess_name}'.")
+                return 0
 
-        hit_quota = any(kw in err_text for kw in quota_keywords)
-
-        if hit_quota and attempt < len(ordered_slots) - 1:
+        # On any error, rotate to the next pooled account if available
+        if attempt < len(ordered_slots) - 1:
             next_slot = ordered_slots[attempt + 1]
-            print(f"\n[colab-pool] Notice: Account Slot {slot} hit limit or session conflict.")
-            print(f"[colab-pool] Automatically falling back to Account Slot {next_slot}...\n")
+            print(f"\n[colab-pool] Notice: Account Slot {slot} encountered an error ({proc.returncode}).")
+            print(f"[colab-pool] Automatically rotating to Account Slot {next_slot}...\n")
             continue
         else:
             return proc.returncode
