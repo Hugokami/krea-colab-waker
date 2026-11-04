@@ -23,18 +23,19 @@ jobs:
         run: |
           pip install --no-cache-dir google-colab-cli
 
-      - name: Configure Colab credentials
+      - name: Configure Colab Accounts Pool
         env:
-          COLAB_ACCOUNT_B64: ${{ secrets.COLAB_ACCOUNT_B64 }}
+          COLAB_ACCOUNTS_B64: ${{ secrets.COLAB_ACCOUNTS_B64 }}
         run: |
           mkdir -p ~/.config/colab-cli/accounts
-          echo "$COLAB_ACCOUNT_B64" | base64 -d > ~/.config/colab-cli/token.json
-          cp ~/.config/colab-cli/token.json ~/.config/colab-cli/accounts/account_1.json
+          echo "$COLAB_ACCOUNTS_B64" | base64 -d | tar -xz -C ~/.config/colab-cli/accounts
+          first_acc=$(ls ~/.config/colab-cli/accounts | head -n 1)
+          cp ~/.config/colab-cli/accounts/$first_acc ~/.config/colab-cli/token.json
           echo "1" > ~/.config/colab-cli/active_slot.txt
 
-      - name: Allocate Colab T4 GPU Session
+      - name: Allocate Colab T4 GPU Session (with 6-Account Fallback)
         run: |
-          colab new -s krea --gpu T4 || echo "Session already active or assigned."
+          python colab_pool.py run new -s krea --gpu T4
 
       - name: Deploy and Start Colab Agent
         env:
