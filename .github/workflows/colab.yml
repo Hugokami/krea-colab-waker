@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install google-colab-cli
         run: |
@@ -27,8 +27,10 @@ jobs:
         env:
           COLAB_ACCOUNT_B64: ${{ secrets.COLAB_ACCOUNT_B64 }}
         run: |
-          mkdir -p ~/.config/colab-cli
+          mkdir -p ~/.config/colab-cli/accounts
           echo "$COLAB_ACCOUNT_B64" | base64 -d > ~/.config/colab-cli/token.json
+          cp ~/.config/colab-cli/token.json ~/.config/colab-cli/accounts/account_1.json
+          echo "1" > ~/.config/colab-cli/active_slot.txt
 
       - name: Allocate Colab T4 GPU Session
         run: |
