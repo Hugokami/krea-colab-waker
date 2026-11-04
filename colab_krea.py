@@ -455,9 +455,9 @@ def _tail(path: str, n: int = 40) -> str:
 def start_comfy():
     if comfy_alive():
         return
-    print("[krea] Starting ComfyUI server ...")
+    print("[krea] Starting ComfyUI server with --lowvram for 16GB T4 GPU stability ...")
     log = open(COMFY_LOG, "ab")
-    proc = subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188"],
+    proc = subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--lowvram"],
                             cwd=COMFY_DIR, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(240):
         if comfy_alive():
@@ -884,6 +884,11 @@ def agent_main():
                 urllib.request.urlopen(fail_req, timeout=15)
             except Exception:
                 pass
+            try:
+                start_comfy()
+            except Exception:
+                pass
+            last_activity = time.time()
             last_activity = time.time()
 
 
