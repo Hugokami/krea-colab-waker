@@ -163,10 +163,12 @@ def edit_dims(w: int, h: int, max_pixels: int = 1024 * 1024, multiple: int = 16)
 
 def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, steps: int, cfg: float,
                 seed: int, edit_image: str | None = None, lora_strength: float = 1.0, denoise: float = 1.0,
-                lora_name: str | None = None, dmd_lora: str | None = None) -> dict:
-    """ComfyUI API-format workflow. Node ids 1-9 are fixed; test_krea.py asserts on them."""
+                lora_name: str | None = None, dmd_lora: str | None = None, weight_dtype: str = "fp8_e4m3fn") -> dict:
+    """ComfyUI API-format workflow. Node ids 1-9 are fixed; test_krea.py asserts on them.
+    fp8_e4m3fn keeps UNet (~8.0GB) resident in 15GB T4 VRAM alongside text encoder, eliminating PCIe bus thrashing.
+    """
     g = {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": "default"}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": weight_dtype}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": eng["clip"], "type": eng["clip_type"]}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": eng["vae"]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
@@ -379,11 +381,11 @@ def ensure_models(engine: str, mode: str, use_drive: bool, progress_cb=None):
                 pass
         from huggingface_hub import hf_hub_download
         os.replace(hf_hub_download(eng["repo"], repo_path, local_dir=HF_DL_DIR), target)
-        if use_drive and _size(target) <= 11_000_000_000:
+        if use_drive:
             try:
                 if progress_cb:
                     try:
-                        progress_cb({"phase": f"Caching {name} to Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 20})
+                        progress_cb({"phase": f"Caching {name} ({sz_gb:.1f} GB) to Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 25})
                     except Exception:
                         pass
                 print(f"[krea] Saving {name} permanently to Google Drive ({cached}) ...")
@@ -720,8 +722,9 @@ def agent_main():
     print(f"[krea-agent] Starting Colab Agent for Worker: {worker_url}")
     use_drive = mount_drive()
     bootstrap(use_drive)
-    print("[krea-agent] Pre-loading and caching MOSS-Image BF16 models (gen + edit) on Google Drive...")
+    print("[krea-agent] Pre-loading and caching MOSS-Image models + 8-step DMD Turbo LoRA on Google Drive...")
     ensure_models("moss", "edit", use_drive)
+    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
     start_comfy()
     print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
 
@@ -813,7 +816,8 @@ def agent_main():
                 with open(ply_path, "rb") as f:
                     ply_bytes = f.read()
 
-                done_url = f"{worker_url}/agent/done/{jid}"
+                render_s = max(1, int(time.time() - last_activity))
+                done_url = f"{worker_url}/agent/done/{jid}?render_s={render_s}"
                 done_req = urllib.request.Request(done_url, data=ply_bytes, headers={
                     "Authorization": f"Bearer {agent_secret}",
                     "Content-Type": "application/octet-stream",
@@ -893,7 +897,8 @@ def agent_main():
                 except Exception as de:
                     print(f"[krea-agent] Drive output backup notice: {de}")
 
-            done_url = f"{worker_url}/agent/done/{jid}"
+            render_s = max(1, int(time.time() - last_activity))
+            done_url = f"{worker_url}/agent/done/{jid}?render_s={render_s}"
             done_req = urllib.request.Request(done_url, data=img_bytes, headers={
                 "Authorization": f"Bearer {agent_secret}",
                 "Content-Type": "image/png",
