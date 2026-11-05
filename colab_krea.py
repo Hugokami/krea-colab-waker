@@ -42,6 +42,13 @@ CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/dow
 CLOUDFLARED_LOG = "/content/cloudflared.log"
 TUNNEL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
 IDLE_TIMEOUT_SECONDS = 1500  # 25 minutes
+WARM_TZ_OFFSET_MIN = 390      # Asia/Yangon UTC+6:30
+WARM_FROM = 8                 # 08:00
+WARM_TO = 24                  # 24:00 (midnight)
+
+def _in_warm_window() -> bool:
+    h = time.gmtime(time.time() + WARM_TZ_OFFSET_MIN * 60).tm_hour
+    return WARM_FROM <= h < WARM_TO
 RENDER_TIMEOUT_SECONDS = 1500
 MODES = ("gen", "edit", "3d", "ui", "probe", "prefetch", "agent")
 ENV_KEYS = ("KREA_MODE", "KREA_ENGINE", "KREA_PROMPT_B64", "KREA_NEG_B64", "KREA_W", "KREA_H",
@@ -258,7 +265,7 @@ def _idle_watchdog():
             _reset_activity()
             continue
         idle = time.time() - globals()["_LAST_ACTIVITY"]
-        if idle > IDLE_TIMEOUT_SECONDS:
+        if idle > IDLE_TIMEOUT_SECONDS and not _in_warm_window():
             print(f"\n[krea] Idle {round(idle / 60, 1)} min. Unassigning runtime to save compute units...")
             try:
                 from google.colab import runtime
@@ -833,7 +840,7 @@ def agent_main():
     while True:
         time.sleep(3)
         # Check 25-minute idle timeout
-        if time.time() - last_activity > IDLE_TIMEOUT_SECONDS:
+        if (time.time() - last_activity > IDLE_TIMEOUT_SECONDS) and not _in_warm_window():
             print(f"[krea-agent] Idle for {round(IDLE_TIMEOUT_SECONDS / 60)} minutes. Releasing GPU...")
             try:
                 from google.colab import runtime

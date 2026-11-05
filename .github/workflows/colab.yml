@@ -10,6 +10,7 @@ concurrency:
 jobs:
   wake:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,21 +24,31 @@ jobs:
         run: |
           pip install --no-cache-dir google-colab-cli
 
-      - name: Configure Colab Accounts Pool
+      - name: Configure Colab Accounts Pool & Round-Robin Start
         env:
           COLAB_ACCOUNTS_B64: ${{ secrets.COLAB_ACCOUNTS_B64 }}
         run: |
           mkdir -p ~/.config/colab-cli/accounts
           echo "$COLAB_ACCOUNTS_B64" | base64 -d | tar -xz -C ~/.config/colab-cli/accounts
-          first_acc=$(ls ~/.config/colab-cli/accounts | head -n 1)
-          cp ~/.config/colab-cli/accounts/$first_acc ~/.config/colab-cli/token.json
-          echo "1" > ~/.config/colab-cli/active_slot.txt
+          ACCS=($(ls ~/.config/colab-cli/accounts/account_*.json | sort))
+          NUM_ACCS=${#ACCS[@]}
+          if [ "$NUM_ACCS" -eq 0 ]; then
+            echo "Error: No accounts found in pool!"
+            exit 1
+          fi
+          IDX=$(( GITHUB_RUN_NUMBER % NUM_ACCS ))
+          START_ACC=${ACCS[$IDX]}
+          SLOT_NUM=$(basename "$START_ACC" | grep -o '[0-9]\+')
+          echo "Selected Account Slot $SLOT_NUM ($START_ACC) for Run #$GITHUB_RUN_NUMBER (out of $NUM_ACCS accounts)"
+          cp "$START_ACC" ~/.config/colab-cli/token.json
+          echo "$SLOT_NUM" > ~/.config/colab-cli/active_slot.txt
 
       - name: Allocate Colab T4 GPU Session (with 6-Account Fallback)
         run: |
           python colab_pool.py run new -s krea --gpu T4
 
       - name: Deploy and Start Colab Agent
+        continue-on-error: true
         env:
           KREA_WORKER_URL: ${{ secrets.KREA_WORKER_URL }}
           KREA_AGENT_SECRET: ${{ secrets.KREA_AGENT_SECRET }}
@@ -48,4 +59,9 @@ jobs:
             --env KREA_MODE=agent \
             --env KREA_WORKER_URL="$KREA_WORKER_URL" \
             --env KREA_AGENT_SECRET="$KREA_AGENT_SECRET" \
-            --timeout 7200
+            --timeout 21000
+
+      - name: Release Colab session
+        if: always()
+        run: |
+          colab stop -s krea || true
