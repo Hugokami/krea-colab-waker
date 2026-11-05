@@ -277,16 +277,33 @@ def _init_watchdog():
         print("[krea] Idle watchdog armed (25 min, ComfyUI-queue aware).")
 
 
+# Known static Hugging Face repository file paths (bypasses slow API list_repo_tree calls)
+KNOWN_HF_PATHS = {
+    "moss_image_sft_bf16.safetensors": "diffusion_models/moss_image_sft_bf16.safetensors",
+    "qwen3.5_9b_int8_convrot.safetensors": "text_encoders/qwen3.5_9b_int8_convrot.safetensors",
+    "flux2-vae.safetensors": "vae/flux2-vae.safetensors",
+    "moss_image_edit_lora_rank_64_bf16.safetensors": "loras/moss_image_edit_lora_rank_64_bf16.safetensors",
+    "moss_image_color_depth_control.safetensors": "loras/moss_image_color_depth_control.safetensors",
+    "moss_image_sft_8step_dmd.safetensors": "lora.safetensors",
+    "krea2_turbo_int8_convrot.safetensors": "diffusion_models/krea2_turbo_int8_convrot.safetensors",
+    "qwen3vl_4b_int8_convrot.safetensors": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+    "qwen_image_vae.safetensors": "vae/qwen_image_vae.safetensors",
+    "krea2_style_reference.safetensors": "loras/krea2_style_reference.safetensors",
+    "krea2_turbo_lora_rank_64_bf16.safetensors": "loras/krea2_turbo_lora_rank_64_bf16.safetensors",
+}
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap, Drive, model cache
 # ---------------------------------------------------------------------------
 def mount_drive() -> bool:
-    if not os.path.isdir(DRIVE_ROOT):
-        try:
-            from google.colab import drive
-            drive.mount("/content/drive", force_remount=False)
-        except Exception as e:
-            print(f"[krea] Drive not mounted ({e}); using Colab SSD only.")
+    if os.path.isdir(DRIVE_ROOT):
+        return True
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False, timeout_ms=3000)
+    except Exception as e:
+        print(f"[krea] Drive not mounted ({e}); using Colab SSD only.")
     if os.path.isdir(DRIVE_ROOT):
         os.makedirs(DRIVE_CACHE, exist_ok=True)
         os.makedirs(f"{DRIVE_ROOT}/krea_comfy_outputs", exist_ok=True)
@@ -322,8 +339,13 @@ def bootstrap(use_drive: bool = False):
 
 def repo_index(repo: str) -> dict:
     from huggingface_hub import HfApi
-    return {f.path: f.size for f in HfApi().list_repo_tree(repo, recursive=True)
-            if getattr(f, "size", None) is not None}
+    try:
+        api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+        return {f.path: f.size for f in api.list_repo_tree(repo, recursive=True)
+                if getattr(f, "size", None) is not None}
+    except Exception as e:
+        print(f"[krea] Notice: HF list_repo_tree({repo}) error: {e}")
+        return {}
 
 
 def _size(path: str) -> int:
@@ -362,16 +384,18 @@ def ensure_models(engine: str, mode: str, use_drive: bool, progress_cb=None):
             _atomic_copy(cached, target)
             _reset_activity()
             continue
-        if index is None:
-            index = repo_index(eng["repo"])
-        repo_path = resolve_repo_path(index, name)
+        repo_path = KNOWN_HF_PATHS.get(name)
         if repo_path is None:
-            msg = f"{name} not in {eng['repo']}. Candidates: {sorted(p for p in index if p.endswith('.safetensors'))}"
+            if index is None:
+                index = repo_index(eng["repo"])
+            repo_path = resolve_repo_path(index, name)
+        if repo_path is None:
+            msg = f"{name} not in {eng['repo']}. Candidates: {sorted(p for p in (index or {}) if p.endswith('.safetensors'))}"
             if optional:
                 print(f"[krea] Optional file skipped: {msg}")
                 continue
             raise RuntimeError(msg)
-        if use_drive and _size(cached) == index[repo_path]:
+        if use_drive and index and repo_path in index and _size(cached) == index[repo_path]:
             print(f"[krea] Google Drive cache hit: {name}")
             if progress_cb:
                 try:
@@ -380,7 +404,7 @@ def ensure_models(engine: str, mode: str, use_drive: bool, progress_cb=None):
                     pass
             _atomic_copy(cached, target)
             continue
-        sz_gb = index[repo_path] / 1e9
+        sz_gb = (index[repo_path] / 1e9) if (index and repo_path in index) else 5.0
         print(f"[krea] Downloading {repo_path} ({sz_gb:.2f} GB) ...")
         if progress_cb:
             try:
@@ -415,13 +439,15 @@ def ensure_lora(repo: str, lora_name: str, use_drive: bool, remote_name: str | N
         print(f"[krea] Google Drive cache hit: {lora_name} -> staging to SSD...")
         _atomic_copy(cached, target)
         return
-    index = repo_index(repo)
     lookup = remote_name or lora_name
-    repo_path = resolve_repo_path(index, lookup)
+    repo_path = KNOWN_HF_PATHS.get(lookup)
+    if not repo_path:
+        index = repo_index(repo)
+        repo_path = resolve_repo_path(index, lookup)
     if not repo_path:
         print(f"[krea] Warning: LoRA {lookup} not found in {repo}")
         return
-    print(f"[krea] Downloading LoRA {lora_name} from {repo}/{repo_path} ({index[repo_path] / 1e6:.1f} MB) ...")
+    print(f"[krea] Downloading LoRA {lora_name} from {repo}/{repo_path} ...")
     if progress_cb:
         try:
             progress_cb({"phase": f"Downloading LoRA {lora_name}...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 10})
