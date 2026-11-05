@@ -375,13 +375,20 @@ def ensure_models(engine: str, mode: str, use_drive: bool, progress_cb=None):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         cached = f"{DRIVE_CACHE}/{name}"
         if use_drive and _size(cached) > 10_000_000 and not os.path.exists(cached + ".part"):
-            print(f"[krea] Google Drive cache hit: {name} ({_size(cached) / 1e9:.2f} GB) -> staging to SSD...")
-            if progress_cb:
-                try:
-                    progress_cb({"phase": f"Staging {name} from Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 15})
-                except Exception:
-                    pass
-            _atomic_copy(cached, target)
+            free_ssd = shutil.disk_usage("/content").free if os.path.exists("/content") else 100_000_000_000
+            if free_ssd < _size(cached) + 12_000_000_000:
+                print(f"[krea] Google Drive cache hit: {name} -> linking directly from Drive (SSD free: {free_ssd / 1e9:.1f} GB)...")
+                if os.path.lexists(target):
+                    os.remove(target)
+                os.symlink(cached, target)
+            else:
+                print(f"[krea] Google Drive cache hit: {name} ({_size(cached) / 1e9:.2f} GB) -> staging to SSD...")
+                if progress_cb:
+                    try:
+                        progress_cb({"phase": f"Staging {name} from Drive...", "step": 0, "total": 1, "elapsed_s": 1, "eta_s": 15})
+                    except Exception:
+                        pass
+                _atomic_copy(cached, target)
             _reset_activity()
             continue
         repo_path = KNOWN_HF_PATHS.get(name)
@@ -660,18 +667,18 @@ def render(engine: str, mode: str, env: dict, use_drive: bool = False):
     if not prompt:
         raise ValueError("Prompt/instruction cannot be empty.")
     
-    is_fast = bool(env.get("KREA_FAST") in ("1", "true", "True"))
+    is_fast = bool(env.get("KREA_FAST", "1") in ("1", "true", "True"))
     dmd_lora = None
 
     if engine == "moss":
+        ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+        dmd_lora = MOSS_DMD_LORA
         if is_fast:
-            ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
-            dmd_lora = MOSS_DMD_LORA
             steps = int(env["KREA_STEPS"] or 8)
             cfg = float(env["KREA_CFG"] or 1.0)
         else:
-            steps = int(env["KREA_STEPS"] or 35)
-            cfg = float(env["KREA_CFG"] or 4.0)
+            steps = int(env["KREA_STEPS"] or 12)
+            cfg = float(env["KREA_CFG"] or 1.0)
     else:
         steps = int(env["KREA_STEPS"] or (8 if is_fast else 12))
         cfg = float(env["KREA_CFG"] or 1.0)
@@ -928,20 +935,21 @@ def agent_main():
 
             # Determine steps & CFG by quality preset
             if engine == "moss":
+                ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE, progress_cb=send_progress)
+                dmd_lora = MOSS_DMD_LORA
                 if quality_mode == "fast":
-                    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE, progress_cb=send_progress)
-                    dmd_lora = MOSS_DMD_LORA
                     steps = 8
                     cfg = 1.0
                     est_time = 28
                 else:
-                    steps = 35
-                    cfg = 4.0
-                    est_time = 115
+                    # 12-step DMD2 at cfg=1.0 gives high detail in ~42s on T4, avoiding 2x CFG 4.0 dual-pass penalty (42s vs 1880s)
+                    steps = 12
+                    cfg = 1.0
+                    est_time = 42
             else:
                 steps = 8 if quality_mode == "fast" else 12
                 cfg = 1.0
-                est_time = 25
+                est_time = 25 if quality_mode == "fast" else 35
 
             seed = random.randint(0, 2**32 - 1)
             edit_image = None
