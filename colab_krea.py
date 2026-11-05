@@ -789,11 +789,11 @@ def _start_heartbeat_thread(worker_url: str, headers: dict):
 
 
 def _prewarm_vram(worker_url: str, headers: dict):
-    """If no job is already waiting in D1 queue, run a 1-step 256x256 pass so UNet, CLIP, DMD LoRA, and VAE are hot in T4 VRAM."""
+    """If no job is already waiting in D1 queue, run a 1-step 256x256 pass so UNet, CLIP, and VAE are hot in T4 VRAM."""
     try:
-        eng = ENGINES["moss"]
-        print("[krea-agent] Pre-warming T4 GPU VRAM (loading FP8 UNet + Qwen CLIP + 8-step DMD LoRA)...")
-        warm_graph = build_graph(eng, "warmup", "", 256, 256, 1, 1.0, 42, dmd_lora=MOSS_DMD_LORA, weight_dtype="fp8_e4m3fn")
+        eng = ENGINES["krea2"]
+        print("[krea-agent] Pre-warming T4 GPU VRAM with KREA 2 Turbo (INT8 UNet + CLIP + VAE)...")
+        warm_graph = build_graph(eng, "warmup", "", 256, 256, 1, 1.0, 42)
         run_prompt(warm_graph, timeout=180)
         print("[krea-agent] T4 GPU VRAM pre-warmed! First user prompt will render immediately with 0s model load delay.")
     except Exception as e:
@@ -824,9 +824,8 @@ def agent_main():
     comfy_thread = threading.Thread(target=start_comfy, daemon=True)
     comfy_thread.start()
 
-    print("[krea-agent] Staging MOSS-Image gen models + 8-step DMD Turbo LoRA from Google Drive...")
-    ensure_models("moss", "gen", use_drive)
-    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+    print("[krea-agent] Staging KREA 2 Turbo gen models from Google Drive...")
+    ensure_models("krea2", "gen", use_drive)
     comfy_thread.join()
     start_comfy()  # verify alive
 
@@ -883,7 +882,7 @@ def agent_main():
         last_activity = time.time()
         jid = job["id"]
         mode = job["mode"]
-        engine = job.get("engine", "moss")
+        engine = job.get("engine", "krea2")
         ar = job.get("ar", "1:1")
         res_tier = job.get("res", "1mp")
         quality_mode = job.get("quality", "fast")
