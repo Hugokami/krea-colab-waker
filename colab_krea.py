@@ -782,7 +782,7 @@ def agent_main():
         engine = job.get("engine", "moss")
         ar = job.get("ar", "1:1")
         res_tier = job.get("res", "1mp")
-        quality_mode = job.get("quality", "quality")
+        quality_mode = job.get("quality", "fast")
         lora_mode = job.get("lora", "none")
         prompt = job["prompt"]
 
