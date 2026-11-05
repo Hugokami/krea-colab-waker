@@ -483,9 +483,9 @@ def _tail(path: str, n: int = 40) -> str:
 def start_comfy():
     if comfy_alive():
         return
-    print("[krea] Starting ComfyUI server with --lowvram for 16GB T4 GPU stability ...")
+    print("[krea] Starting ComfyUI server with normal VRAM management for 16GB T4 GPU ...")
     log = open(COMFY_LOG, "ab")
-    proc = subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--lowvram"],
+    proc = subprocess.Popen([sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--dont-print-server"],
                             cwd=COMFY_DIR, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(240):
         if comfy_alive():
@@ -713,30 +713,68 @@ def probe():
     print("KREA_PROBE_DONE")
 
 
+def _start_heartbeat_thread(worker_url: str, headers: dict):
+    def _hb():
+        while True:
+            try:
+                req = urllib.request.Request(f"{worker_url}/agent/next?ping=1", data=b"{}", headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    pass
+            except Exception:
+                pass
+            time.sleep(15)
+    t = threading.Thread(target=_hb, daemon=True)
+    t.start()
+
+
+def _prewarm_vram(worker_url: str, headers: dict):
+    """If no job is already waiting in D1 queue, run a 1-step 256x256 pass so UNet, CLIP, DMD LoRA, and VAE are hot in T4 VRAM."""
+    try:
+        eng = ENGINES["moss"]
+        print("[krea-agent] Pre-warming T4 GPU VRAM (loading FP8 UNet + Qwen CLIP + 8-step DMD LoRA)...")
+        warm_graph = build_graph(eng, "warmup", "", 256, 256, 1, 1.0, 42, dmd_lora=MOSS_DMD_LORA, weight_dtype="fp8_e4m3fn")
+        run_prompt(warm_graph, timeout=180)
+        print("[krea-agent] T4 GPU VRAM pre-warmed! First user prompt will render immediately with 0s model load delay.")
+    except Exception as e:
+        print(f"[krea-agent] Pre-warm notice (non-fatal): {e}")
+
+
 def agent_main():
     worker_url = os.environ.get("KREA_WORKER_URL", "").rstrip("/")
     agent_secret = os.environ.get("KREA_AGENT_SECRET", "")
     if not worker_url or not agent_secret:
         raise ValueError("KREA_WORKER_URL and KREA_AGENT_SECRET must be set for agent mode.")
 
-    print(f"[krea-agent] Starting Colab Agent for Worker: {worker_url}")
-    use_drive = mount_drive()
-    bootstrap(use_drive)
-    print("[krea-agent] Pre-loading and caching MOSS-Image models + 8-step DMD Turbo LoRA on Google Drive...")
-    ensure_models("moss", "edit", use_drive)
-    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
-    start_comfy()
-    print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
-
-    last_activity = time.time()
-    last_hb = 0.0
-    last_err = 0.0
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     headers = {
         "Authorization": f"Bearer {agent_secret}",
         "Content-Type": "application/json",
         "User-Agent": ua,
     }
+
+    print(f"[krea-agent] Starting Colab Agent for Worker: {worker_url}")
+    # Immediate heartbeat so Telegram shows ONLINE within 2s of container start
+    _start_heartbeat_thread(worker_url, headers)
+
+    use_drive = mount_drive()
+    bootstrap(use_drive)
+
+    # Start ComfyUI server in parallel while staging models from Google Drive to SSD
+    comfy_thread = threading.Thread(target=start_comfy, daemon=True)
+    comfy_thread.start()
+
+    print("[krea-agent] Staging MOSS-Image gen models + 8-step DMD Turbo LoRA from Google Drive...")
+    ensure_models("moss", "gen", use_drive)
+    ensure_lora(MOSS_DMD_REPO, MOSS_DMD_LORA, use_drive, remote_name=MOSS_DMD_REMOTE)
+    comfy_thread.join()
+    start_comfy()  # verify alive
+
+    prewarmed = False
+    print("[krea-agent] ComfyUI ready. Polling for jobs from Cloudflare D1...")
+
+    last_activity = time.time()
+    last_hb = 0.0
+    last_err = 0.0
 
     while True:
         time.sleep(3)
@@ -774,7 +812,12 @@ def agent_main():
 
         job = res.get("job")
         if not job:
+            if not prewarmed:
+                prewarmed = True
+                _prewarm_vram(worker_url, headers)
+                last_activity = time.time()
             continue
+        prewarmed = True
 
         last_activity = time.time()
         jid = job["id"]
