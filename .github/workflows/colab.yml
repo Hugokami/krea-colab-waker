@@ -5,7 +5,7 @@ on:
 
 concurrency:
   group: colab-runner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   wake:
@@ -51,4 +51,4 @@ jobs:
             --env KREA_MODE=agent \
             --env KREA_WORKER_URL="$KREA_WORKER_URL" \
             --env KREA_AGENT_SECRET="$KREA_AGENT_SECRET" \
-            --timeout 14400
+            --timeout 7200

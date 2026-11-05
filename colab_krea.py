@@ -833,6 +833,9 @@ def agent_main():
 
         try:
             def send_progress(prog: dict):
+                nonlocal last_activity
+                last_activity = time.time()
+                _reset_activity()
                 try:
                     p_url = f"{worker_url}/agent/progress/{jid}"
                     p_req = urllib.request.Request(p_url, data=json.dumps(prog).encode("utf-8"), headers=headers, method="POST")
@@ -967,14 +970,14 @@ def agent_main():
 
 
 def main():
-    _init_watchdog()
-    _reset_activity()
     env = {k: os.environ.pop(k, "") for k in ENV_KEYS}
     mode = env["KREA_MODE"] or "gen"
     engine = env["KREA_ENGINE"] or "moss"
     if mode == "agent":
         agent_main()
         return
+    _init_watchdog()
+    _reset_activity()
     if mode not in MODES or (mode != "3d" and engine not in ENGINES):
         raise ValueError(f"Bad KREA_MODE={mode!r} or KREA_ENGINE={engine!r}")
     use_drive = (mode == "3d" or ENGINES[engine]["drive_cache"]) and mount_drive()
