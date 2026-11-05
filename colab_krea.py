@@ -65,6 +65,7 @@ ENGINES = {
         "control_lora": "moss_image_color_depth_control.safetensors",
         "dmd_lora": MOSS_DMD_LORA,
         "clip_type": "moss_image",
+        "weight_dtype": "fp8_e4m3fn",
         "steps": 35, "cfg": 4.0, "sampler": "euler", "scheduler": "simple",
         "drive_cache": True,
     },
@@ -76,7 +77,8 @@ ENGINES = {
         "edit_lora": "krea2_style_reference.safetensors",
         "style_lora": "krea2_style_reference.safetensors",
         "turbo_lora": "krea2_turbo_lora_rank_64_bf16.safetensors",
-        "clip_type": "qwen_image",
+        "clip_type": "krea2",
+        "weight_dtype": "default",
         "steps": 8, "cfg": 1.0, "sampler": "euler", "scheduler": "simple",
         "drive_cache": True,
     },
@@ -167,12 +169,18 @@ def build_graph(eng: dict, prompt: str, negative: str, width: int, height: int, 
     """ComfyUI API-format workflow. Node ids 1-9 are fixed; test_krea.py asserts on them.
     fp8_e4m3fn keeps UNet (~8.0GB) resident in 15GB T4 VRAM alongside text encoder, eliminating PCIe bus thrashing.
     """
+    actual_weight_dtype = eng.get("weight_dtype", weight_dtype)
+    neg_node = (
+        {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}}
+        if (eng.get("clip_type") == "krea2" and not negative)
+        else {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["2", 0]}}
+    )
     g = {
-        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": weight_dtype}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": eng["unet"], "weight_dtype": actual_weight_dtype}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": eng["clip"], "type": eng["clip_type"]}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": eng["vae"]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["2", 0]}},
+        "5": neg_node,
         "6": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
     }
     model, pos, neg, latent = ["1", 0], ["4", 0], ["5", 0], ["6", 0]
@@ -576,7 +584,20 @@ def run_prompt(graph: dict, timeout: int = RENDER_TIMEOUT_SECONDS, progress_cb=N
         if entry:
             status = entry.get("status", {})
             if status.get("status_str") == "error":
-                raise RuntimeError(f"Workflow failed: {json.dumps(status.get('messages', []))[-3000:]}")
+                err_text = ""
+                for msg in status.get("messages", []):
+                    if isinstance(msg, (list, tuple)) and len(msg) > 1 and isinstance(msg[1], dict):
+                        d = msg[1]
+                        ex_type = d.get("exception_type", "")
+                        ex_msg = d.get("exception_message", "")
+                        node = d.get("node_type", d.get("node_id", ""))
+                        tb = "".join(d.get("traceback", []))
+                        if ex_type or ex_msg:
+                            err_text += f"Node {node} [{ex_type}]: {ex_msg}\n{tb}\n"
+                if not err_text:
+                    err_text = json.dumps(status.get("messages", []))[:2000]
+                tail = _tail(COMFY_LOG, 20)
+                raise RuntimeError(f"Workflow failed:\n{err_text.strip()}\n\nComfyUI log:\n{tail}")
             images = entry.get("outputs", {}).get("9", {}).get("images", [])
             if images:
                 img = images[0]
