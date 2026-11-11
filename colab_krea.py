@@ -528,8 +528,8 @@ def bootstrap_triposr(use_drive: bool = False):
         subprocess.run(["git", "clone", "--depth", "1", TRIPOSR_REPO, TRIPOSR_DIR], check=True)
     try:
         import transformers
-        if not transformers.__version__.startswith("4."):
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.38.2"], check=True)
+        if not transformers.__version__.startswith("4.46."):
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.46.3"], check=True)
     except Exception:
         pass
     shim_path = f"{TRIPOSR_DIR}/torchmcubes.py"
@@ -538,7 +538,7 @@ def bootstrap_triposr(use_drive: bool = False):
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
             "omegaconf", "einops", "trimesh", "rembg", "onnxruntime",
-            "PyMCubes", "transformers==4.38.2", "huggingface_hub", "pillow"
+            "PyMCubes", "transformers==4.46.3", "huggingface_hub", "pillow"
         ], check=True)
         # ponytail: PyMCubes binary wheel shim replaces 4-min nvcc compilation of torchmcubes; add CUDA torchmcubes only if >512^3 grids needed
         with open(shim_path, "w", encoding="utf-8") as sf:
@@ -581,10 +581,11 @@ def bootstrap_triposr(use_drive: bool = False):
     if not os.path.isfile(u2net_path) or _size(u2net_path) < 100_000_000:
         print("[krea-glb] Staging u2net.onnx (176 MB) from HuggingFace ...")
         try:
-            dl = hf_hub_download(repo_id="danielgatis/rembg", filename="u2net.onnx", local_dir=HF_DL_DIR)
+            dl = hf_hub_download(repo_id="tomjackson2023/rembg", filename="u2net.onnx", local_dir=HF_DL_DIR)
             _atomic_copy(dl, u2net_path)
         except Exception as e:
             print(f"[krea-glb] Rembg staging notice: {e}")
+            subprocess.run(["curl", "-sL", "-o", u2net_path, "https://huggingface.co/tomjackson2023/rembg/resolve/main/u2net.onnx"], check=True)
 
 
 def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 256,
