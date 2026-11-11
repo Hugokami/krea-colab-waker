@@ -575,6 +575,16 @@ def bootstrap_triposr(use_drive: bool = False):
                 print(f"[krea-glb] Cached {fname} to Google Drive: {cached_f}")
             except Exception as e:
                 print(f"[krea-glb] Drive cache notice: {e}")
+    u2net_dir = os.path.expanduser("~/.u2net")
+    os.makedirs(u2net_dir, exist_ok=True)
+    u2net_path = f"{u2net_dir}/u2net.onnx"
+    if not os.path.isfile(u2net_path) or _size(u2net_path) < 100_000_000:
+        print("[krea-glb] Staging u2net.onnx (176 MB) from HuggingFace ...")
+        try:
+            dl = hf_hub_download(repo_id="danielgatis/rembg", filename="u2net.onnx", local_dir=HF_DL_DIR)
+            _atomic_copy(dl, u2net_path)
+        except Exception as e:
+            print(f"[krea-glb] Rembg staging notice: {e}")
 
 
 def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 256,
@@ -601,12 +611,12 @@ def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 
     if model is None:
         print(f"[krea-glb] Loading TripoSR model onto {device} ...")
         model = TSR.from_pretrained(TRIPOSR_WEIGHTS_DIR, config_name="config.yaml", weight_name="model.ckpt")
-        model.renderer.set_chunk_size(8192)
+        model.renderer.set_chunk_size(131072)
         model.to(device)
         globals()["_TRIPOSR_MODEL"] = model
     rembg_session = globals().get("_REMBG_SESSION")
     if rembg_session is None:
-        rembg_session = rembg.new_session()
+        rembg_session = rembg.new_session("u2net")
         globals()["_REMBG_SESSION"] = rembg_session
 
     sig_params = inspect.signature(model.extract_mesh).parameters
