@@ -36,6 +36,7 @@ DRIVE_CACHE = f"{DRIVE_ROOT}/comfy_cache"
 HF_DL_DIR = "/content/hf_dl"
 OUT_PATH = "/content/krea_out.png"
 OUT_3D_PATH = "/content/krea_out.ply"
+OUT_GLB_PATH = "/content/krea_out.glb"
 EDIT_INPUT_NAME = "krea_edit_input.png"
 CLOUDFLARED = "/content/cloudflared"
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -50,7 +51,7 @@ def _in_warm_window() -> bool:
     h = time.gmtime(time.time() + WARM_TZ_OFFSET_MIN * 60).tm_hour
     return WARM_FROM <= h < WARM_TO
 RENDER_TIMEOUT_SECONDS = 1500
-MODES = ("gen", "edit", "3d", "ui", "probe", "prefetch", "agent")
+MODES = ("gen", "edit", "3d", "glb", "ui", "probe", "prefetch", "agent")
 ENV_KEYS = ("KREA_MODE", "KREA_ENGINE", "KREA_PROMPT_B64", "KREA_NEG_B64", "KREA_W", "KREA_H",
             "KREA_STEPS", "KREA_CFG", "KREA_SEED", "KREA_INPUT", "KREA_STRENGTH", "KREA_DENOISE",
             "KREA_FAST", "KREA_LORA", "KREA_RES")
@@ -60,6 +61,10 @@ MOSS_DMD_REMOTE = "lora.safetensors"
 MOSS_DMD_LORA = "moss_image_sft_8step_dmd.safetensors"
 IDOL_REPO = "https://github.com/speridlabs/idol-sdk.git"
 IDOL_DIR = "/content/idol-sdk"
+TRIPOSR_REPO = "https://github.com/VAST-AI-Research/TripoSR.git"
+TRIPOSR_DIR = "/content/TripoSR"
+TRIPOSR_WEIGHTS_DIR = "/content/triposr_weights"
+TRIPOSR_HF_REPO = "stabilityai/TripoSR"
 
 # High-precision production engines cached permanently on Google Drive (>1 TB storage)
 ENGINES = {
@@ -509,6 +514,135 @@ def run_idol_3d(input_image: str, prompt: str = "real", use_drive: bool = False)
     return OUT_3D_PATH
 
 
+def bootstrap_triposr(use_drive: bool = False):
+    if not os.path.isdir(TRIPOSR_DIR):
+        print("[krea-glb] Cloning VAST-AI-Research/TripoSR ...")
+        subprocess.run(["git", "clone", "--depth", "1", TRIPOSR_REPO, TRIPOSR_DIR], check=True)
+    shim_path = f"{TRIPOSR_DIR}/torchmcubes.py"
+    if not os.path.isfile(shim_path):
+        print("[krea-glb] Installing TripoSR dependencies & PyMCubes shim ...")
+        subprocess.run([
+            sys.executable, "-m", "pip", "install", "-q",
+            "omegaconf", "einops", "trimesh", "rembg", "onnxruntime",
+            "PyMCubes", "transformers", "huggingface_hub", "pillow"
+        ], check=True)
+        # ponytail: PyMCubes binary wheel shim replaces 4-min nvcc compilation of torchmcubes; add CUDA torchmcubes only if >512^3 grids needed
+        with open(shim_path, "w", encoding="utf-8") as sf:
+            sf.write(
+                "import mcubes\nimport numpy as np\nimport torch\n\n"
+                "def marching_cubes(vol: torch.Tensor, thresh: float):\n"
+                "    v, f = mcubes.marching_cubes(vol.detach().cpu().numpy(), float(thresh))\n"
+                "    dev = vol.device\n"
+                "    return (\n"
+                "        torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32)).to(dev),\n"
+                "        torch.from_numpy(np.ascontiguousarray(f, dtype=np.int64)).to(dev),\n"
+                "    )\n"
+            )
+    os.makedirs(TRIPOSR_WEIGHTS_DIR, exist_ok=True)
+    drive_tsr = f"{DRIVE_CACHE}/triposr"
+    if use_drive:
+        os.makedirs(drive_tsr, exist_ok=True)
+    from huggingface_hub import hf_hub_download
+    for fname in ("config.yaml", "model.ckpt"):
+        local_f = f"{TRIPOSR_WEIGHTS_DIR}/{fname}"
+        if _size(local_f) > 0:
+            continue
+        cached_f = f"{drive_tsr}/{fname}"
+        if use_drive and _size(cached_f) > 100 and not os.path.exists(cached_f + ".part"):
+            print(f"[krea-glb] Staging TripoSR {fname} from Google Drive cache ...")
+            _atomic_copy(cached_f, local_f)
+            continue
+        print(f"[krea-glb] Downloading {TRIPOSR_HF_REPO}/{fname} ...")
+        dl = hf_hub_download(repo_id=TRIPOSR_HF_REPO, filename=fname, local_dir=HF_DL_DIR)
+        _atomic_copy(dl, local_f)
+        if use_drive:
+            try:
+                _atomic_copy(local_f, cached_f)
+                print(f"[krea-glb] Cached {fname} to Google Drive: {cached_f}")
+            except Exception as e:
+                print(f"[krea-glb] Drive cache notice: {e}")
+
+
+def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 256,
+                      use_drive: bool = False) -> list[str]:
+    """Reconstruct one or more images into upright GLTF 2.0 .glb meshes on T4 GPU in a single model load."""
+    import inspect
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps
+
+    bootstrap_triposr(use_drive)
+    try:
+        _http("/free", {"unload_models": True, "free_memory": True}, timeout=5)
+    except Exception:
+        pass
+    if TRIPOSR_DIR not in sys.path:
+        sys.path.insert(0, TRIPOSR_DIR)
+    import rembg
+    from tsr.system import TSR
+    from tsr.utils import remove_background, resize_foreground
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = globals().get("_TRIPOSR_MODEL")
+    if model is None:
+        print(f"[krea-glb] Loading TripoSR model onto {device} ...")
+        model = TSR.from_pretrained(TRIPOSR_WEIGHTS_DIR, config_name="config.yaml", weight_name="model.ckpt")
+        model.renderer.set_chunk_size(8192)
+        model.to(device)
+        globals()["_TRIPOSR_MODEL"] = model
+    rembg_session = globals().get("_REMBG_SESSION")
+    if rembg_session is None:
+        rembg_session = rembg.new_session()
+        globals()["_REMBG_SESSION"] = rembg_session
+
+    sig_params = inspect.signature(model.extract_mesh).parameters
+    results = []
+    for idx, (in_path, out_glb) in enumerate(image_to_out, 1):
+        t0 = time.time()
+        _reset_activity()
+        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Segmenting & reconstructing {os.path.basename(in_path)} (res={mc_resolution}) ...")
+        with Image.open(in_path) as raw:
+            im = ImageOps.exif_transpose(raw).convert("RGB")
+        fg = remove_background(im, rembg_session)
+        fg = resize_foreground(fg, 0.85)
+        arr = np.array(fg).astype(np.float32) / 255.0
+        arr = arr[:, :, :3] * arr[:, :, 3:4] + (1.0 - arr[:, :, 3:4]) * 0.5
+        proc_img = Image.fromarray((arr * 255.0).astype(np.uint8))
+
+        with torch.no_grad():
+            scene_codes = model([proc_img], device=device)
+            # ponytail: vertex-colored GLB at mc_resolution=256 (~1.5s on GPU); add xatlas UV baking only if low-poly UV maps required
+            if "has_vertex_color" in sig_params:
+                meshes = model.extract_mesh(scene_codes, has_vertex_color=True, resolution=mc_resolution, threshold=25.0)
+            else:
+                meshes = model.extract_mesh(scene_codes, resolution=mc_resolution, threshold=25.0)
+
+        mesh = meshes[0]
+        verts = np.asarray(mesh.vertices, dtype=np.float32)
+        # Cyclic permutation (x, y, z) -> (y, z, x) [det=+1]: Z-up -> GLTF Y-up, +X front -> +Z front
+        verts = verts[:, [1, 2, 0]]
+        mins = verts.min(axis=0)
+        maxs = verts.max(axis=0)
+        center_xz = (mins + maxs) * 0.5
+        verts[:, 0] -= center_xz[0]
+        verts[:, 2] -= center_xz[2]
+        verts[:, 1] -= mins[1]
+        mesh.vertices = verts
+
+        os.makedirs(os.path.dirname(os.path.abspath(out_glb)), exist_ok=True)
+        tmp_glb = out_glb + ".part"
+        mesh.export(tmp_glb, file_type="glb")
+        os.replace(tmp_glb, out_glb)
+        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Saved {out_glb} ({_size(out_glb) / 1e6:.2f} MB) in {time.time() - t0:.1f}s")
+        results.append(out_glb)
+    return results
+
+
+def run_triposr_glb(input_image: str, mc_resolution: int = 256, use_drive: bool = False) -> str:
+    run_triposr_batch([(input_image, OUT_GLB_PATH)], mc_resolution=mc_resolution, use_drive=use_drive)
+    return OUT_GLB_PATH
+
+
 # ---------------------------------------------------------------------------
 # ComfyUI server, rendering, tunnel
 # ---------------------------------------------------------------------------
@@ -665,6 +799,12 @@ def render(engine: str, mode: str, env: dict, use_drive: bool = False):
         print(f"[krea] Generating 3D object from {env.get('KREA_INPUT')} via Idol-SDK...")
         out_ply = run_idol_3d(env["KREA_INPUT"], b64d(env["KREA_PROMPT_B64"]), use_drive)
         print(f"KREA_COMPLETE:{out_ply}")
+        return
+    if mode == "glb":
+        mc_res = int(env.get("KREA_STEPS") or 256)
+        print(f"[krea] Generating 3D .glb mesh from {env.get('KREA_INPUT')} via TripoSR (res={mc_res})...")
+        out_glb = run_triposr_glb(env["KREA_INPUT"], mc_resolution=mc_res, use_drive=use_drive)
+        print(f"KREA_COMPLETE:{out_glb}")
         return
 
     eng = ENGINES[engine]
@@ -903,34 +1043,38 @@ def agent_main():
                 except Exception:
                     pass
 
-            # Handle 3D object reconstruction via Idol-SDK
-            if mode == "3d":
+            # Handle 3D object reconstruction via Idol-SDK (.ply) or TripoSR (.glb)
+            if mode in ("3d", "glb"):
                 input_url = f"{worker_url}/agent/input/{jid}"
                 in_req = urllib.request.Request(input_url, headers={
                     "Authorization": f"Bearer {agent_secret}",
                     "User-Agent": ua,
                 })
-                local_in = f"{COMFY_DIR}/input/idol_in_{jid}.png"
-                os.makedirs(f"{COMFY_DIR}/input", exist_ok=True)
+                local_in = f"/content/input_3d_{jid}.png"
                 with urllib.request.urlopen(in_req, timeout=60) as r, open(local_in, "wb") as f:
                     f.write(r.read())
 
-                send_progress({"phase": "Reconstructing 3D Gaussian Splats (Idol-SDK)...", "step": 1, "total": 2, "elapsed_s": 1, "eta_s": 12})
-                ply_path = run_idol_3d(local_in, prompt, use_drive)
-                send_progress({"phase": "Uploading 3D .ply model to Telegram...", "step": 2, "total": 2, "elapsed_s": int(time.time() - last_activity), "eta_s": 2})
+                if mode == "glb" or engine == "triposr":
+                    send_progress({"phase": "Reconstructing 3D .glb mesh (TripoSR on T4)...", "step": 1, "total": 2, "elapsed_s": 1, "eta_s": 6})
+                    mesh_path = run_triposr_glb(local_in, mc_resolution=256, use_drive=use_drive)
+                    send_progress({"phase": "Uploading 3D .glb model to Telegram...", "step": 2, "total": 2, "elapsed_s": int(time.time() - last_activity), "eta_s": 2})
+                else:
+                    send_progress({"phase": "Reconstructing 3D Gaussian Splats (Idol-SDK)...", "step": 1, "total": 2, "elapsed_s": 1, "eta_s": 12})
+                    mesh_path = run_idol_3d(local_in, prompt, use_drive)
+                    send_progress({"phase": "Uploading 3D .ply model to Telegram...", "step": 2, "total": 2, "elapsed_s": int(time.time() - last_activity), "eta_s": 2})
 
-                with open(ply_path, "rb") as f:
-                    ply_bytes = f.read()
+                with open(mesh_path, "rb") as f:
+                    mesh_bytes = f.read()
 
                 render_s = max(1, int(time.time() - last_activity))
                 done_url = f"{worker_url}/agent/done/{jid}?render_s={render_s}"
-                done_req = urllib.request.Request(done_url, data=ply_bytes, headers={
+                done_req = urllib.request.Request(done_url, data=mesh_bytes, headers={
                     "Authorization": f"Bearer {agent_secret}",
-                    "Content-Type": "application/octet-stream",
+                    "Content-Type": "model/gltf-binary" if (mode == "glb" or engine == "triposr") else "application/octet-stream",
                     "User-Agent": ua,
                 }, method="POST")
                 with urllib.request.urlopen(done_req, timeout=60) as r:
-                    print(f"[krea-agent] 3D Job {jid} delivered to Telegram successfully!")
+                    print(f"[krea-agent] 3D Job {jid} ({mode}) delivered to Telegram successfully!")
                 last_activity = time.time()
                 continue
 
@@ -1039,16 +1183,17 @@ def main():
         return
     _init_watchdog()
     _reset_activity()
-    if mode not in MODES or (mode != "3d" and engine not in ENGINES):
+    if mode not in MODES or (mode not in ("3d", "glb") and engine not in ENGINES):
         raise ValueError(f"Bad KREA_MODE={mode!r} or KREA_ENGINE={engine!r}")
-    use_drive = (mode == "3d" or ENGINES[engine]["drive_cache"]) and mount_drive()
-    bootstrap(use_drive)
+    use_drive = (mode in ("3d", "glb") or ENGINES[engine]["drive_cache"]) and mount_drive()
+    if mode not in ("3d", "glb"):
+        bootstrap(use_drive)
     if mode == "probe":
         probe()
         return
-    if mode != "3d":
+    if mode not in ("3d", "glb"):
         ensure_models(engine, mode, use_drive)
-    start_comfy()
+        start_comfy()
     if mode == "prefetch":
         print(f"KREA_READY:{engine}")
     elif mode == "ui":
