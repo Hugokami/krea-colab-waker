@@ -526,13 +526,19 @@ def bootstrap_triposr(use_drive: bool = False):
     if not os.path.isdir(TRIPOSR_DIR):
         print("[krea-glb] Cloning VAST-AI-Research/TripoSR ...")
         subprocess.run(["git", "clone", "--depth", "1", TRIPOSR_REPO, TRIPOSR_DIR], check=True)
+    try:
+        import transformers
+        if not transformers.__version__.startswith("4."):
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers==4.38.2"], check=True)
+    except Exception:
+        pass
     shim_path = f"{TRIPOSR_DIR}/torchmcubes.py"
     if not os.path.isfile(shim_path):
         print("[krea-glb] Installing TripoSR dependencies & PyMCubes shim ...")
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-q",
             "omegaconf", "einops", "trimesh", "rembg", "onnxruntime",
-            "PyMCubes", "transformers", "huggingface_hub", "pillow"
+            "PyMCubes", "transformers==4.38.2", "huggingface_hub", "pillow"
         ], check=True)
         # ponytail: PyMCubes binary wheel shim replaces 4-min nvcc compilation of torchmcubes; add CUDA torchmcubes only if >512^3 grids needed
         with open(shim_path, "w", encoding="utf-8") as sf:
