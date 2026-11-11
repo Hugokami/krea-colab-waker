@@ -15,8 +15,16 @@ import json
 import time
 import uuid
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 _orig_print = builtins.print
-builtins.print = lambda *a, **k: _orig_print(*a, **dict(k, flush=True))
+
+def print(*a, **k):
+    _orig_print(*a, **dict(k, flush=True))
 
 import base64
 import random
