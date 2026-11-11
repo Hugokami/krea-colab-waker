@@ -625,7 +625,7 @@ def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 
     for idx, (in_path, out_glb) in enumerate(image_to_out, 1):
         t0 = time.time()
         _reset_activity()
-        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Segmenting & reconstructing {os.path.basename(in_path)} (res={mc_resolution}) ...")
+        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Segmenting & reconstructing {os.path.basename(in_path)} (res={mc_resolution}) ...", flush=True)
         with Image.open(in_path) as raw:
             im = ImageOps.exif_transpose(raw).convert("RGB")
         fg = remove_background(im, rembg_session)
@@ -658,7 +658,7 @@ def run_triposr_batch(image_to_out: list[tuple[str, str]], mc_resolution: int = 
         tmp_glb = out_glb + ".part"
         mesh.export(tmp_glb, file_type="glb")
         os.replace(tmp_glb, out_glb)
-        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Saved {out_glb} ({_size(out_glb) / 1e6:.2f} MB) in {time.time() - t0:.1f}s")
+        print(f"[krea-glb] [{idx}/{len(image_to_out)}] Saved {out_glb} ({_size(out_glb) / 1e6:.2f} MB) in {time.time() - t0:.1f}s", flush=True)
         results.append(out_glb)
     return results
 
